@@ -1,0 +1,12 @@
+Research Report: Code Me Calculator Python It Python Project 9
+==================================================
+
+I can list things for you, sir. Try asking about:
+- programming languages
+- data structures
+- algorithms
+- design patterns
+- planets
+- elements
+- countries
+Or ask 'list <topic>' for any category.

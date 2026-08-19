@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.env
+*.db
+
+# API Keys
+.jarvis_api_key
+*.key
+
+# PyCharm
+.idea/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Logs
+*.log
+jarvis.log
+jarvis_transcript.log
+
+# Sensitive data
+.jarvis_bot_state.json
+.jarvis_games.json
+jarvis_memory.json
+jarvis_memory_core.json
+jarvis_agent_jobs.json
+jarvis_clipboard.json
+jarvis_notes.txt
+
+# Generated files
+generated_agent/
+generated_websites/
+screenshots/
+master_backup/
+
+# OS
+.DS_Store

@@ -1,0 +1,18 @@
+# JARVIS runtime dependencies
+# Install with: pip install -r requirements.txt
+
+# --- REQUIRED -----------------------------------------------------------
+# Hard imports at module top-level; app will not start without these.
+requests>=2            # Groq LLM API calls + network-guarded skills (power_skills)
+SpeechRecognition>=3   # Microphone voice input (main.py)
+pillow>=12             # Image handling for QR codes / screenshots (PIL)
+
+# --- OPTIONAL-GRACEFUL --------------------------------------------------
+# Wrapped in try/except or lazy imports; features degrade if missing.
+pyttsx3>=2             # Text-to-speech voice replies (optional in main.py)
+psutil>=7              # CPU/RAM/battery system stats (optional in main.py)
+qrcode>=8              # QR code generation (lazy import in skills)
+pyperclip>=1           # Clipboard history / paste skills (lazy import)
+PyAutoGUI>=0           # Screen automation + screenshots (lazy import)
+pynput>=1.7            # Global push-to-talk hotkey (jarvis/hotkey_ptt.py)
+six>=1.16              # Dependency of pynput

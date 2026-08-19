@@ -1,0 +1,1 @@
+I can generate code locally for: calculator, fibonacci, sorting, binary search, todo app, login/signup, API server, games, and more. Tell me the language (Python, JavaScript, HTML) and I will write it, sir.
