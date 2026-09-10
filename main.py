@@ -23,6 +23,25 @@ from collections import deque
 _JARVIS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jarvis")
 if _JARVIS_DIR not in sys.path:
     sys.path.insert(0, _JARVIS_DIR)
+
+if platform.system() == "Darwin":
+    class _LaunchServicesBrowser(webbrowser.BaseBrowser):
+        """Default macOS browser via LaunchServices `open`.
+
+        webbrowser's osascript-based default needs per-app Automation
+        permission and fails silently without it; `open` does not.
+        """
+
+        def open(self, url, new=0, autoraise=True):
+            try:
+                subprocess.Popen(["open", url])
+                return True
+            except Exception:
+                return False
+
+    webbrowser.register("macos_launchservices", _LaunchServicesBrowser,
+                        preferred=True)
+
 from brain import Brain
 
 import brain as brain_core
@@ -60,7 +79,6 @@ GROQ_MODEL_CHOICES = [
     "openai/gpt-oss-20b",
     "meta-llama/llama-3.3-70b-versatile",
     "llama-3.1-8b-instant",
-    "llama3-70b-8192",
 ]
 ACTIVE_MODEL = GROQ_MODEL
 
@@ -306,8 +324,12 @@ def parse_build_request(cmd):
     if not kind_m:
         return None
     kind = kind_m.group(0)
-    # An app/application/android/mobile kind => an "app" build (Android in AI Studio).
-    is_app = bool(re.search(r"\b(?:app|application|android|mobile)\b", kind, re.I))
+    # An app/application/android/mobile kind => an "app" build (Android in
+    # AI Studio) — but "web app"/"web application" is a website, not an
+    # Android build.
+    is_app = bool(re.search(r"\b(?:android|mobile)\b", kind, re.I)
+                  or (re.search(r"\b(?:app|application)\b", kind, re.I)
+                      and not re.search(r"\bweb\b", kind, re.I)))
     before = c[:kind_m.start()]
     after = c[kind_m.end():]
     # Strip boilerplate ("build me a / make an ...") from the leading chunk.
@@ -448,8 +470,18 @@ def open_aistudio_build(prompt, is_app=False):
     Returns True if the browser was asked to open the build page. The prompt
     arrives pre-filled in the prompt section thanks to the `prompt` URL param.
     """
+    url = aistudio_build_url(prompt, is_app)
+    if platform.system() == "Darwin":
+        # LaunchServices `open` honors the default browser and needs no
+        # per-app AppleEvent permission, unlike webbrowser.open's osascript
+        # route, which fails silently without the Automation permission.
+        try:
+            subprocess.Popen(["open", url])
+            return True
+        except Exception:
+            pass
     try:
-        webbrowser.open(aistudio_build_url(prompt, is_app))
+        webbrowser.open(url)
         return True
     except Exception:
         return False
@@ -580,15 +612,32 @@ def sanitize_filename(filename, default_ext=".txt"):
     return name
 
 
+def _harness_clean(reply):
+    """Normalize any LLM reply through prompt_harness.clean_reply (no-raise)."""
+    try:
+        if isinstance(reply, str) and reply.strip():
+            from prompt_harness import clean_reply
+            return clean_reply(reply) or reply
+    except Exception:
+        pass
+    return reply
+
+
 def ask_ai(prompt, history=None):
     # Provider abstraction: JARVIS_PROVIDER (openai|anthropic|ollama)
     # routes through llm_client; default stays the native Groq path.
     provider_name = os.environ.get("JARVIS_PROVIDER", "").strip().lower()
     if provider_name and provider_name != "groq":
         try:
-            from llm_client import LLMClient
+            from llm_client import LLMClient, chat_anywhere
             reply = LLMClient().chat(prompt, history=history,
                                      system=_system_prompt())
+            if reply is None:
+                # Fall back to Gemini before giving up on the custom backend.
+                reply = chat_anywhere(prompt, history=history,
+                                      system=_system_prompt(),
+                                      chain=("google",))
+                reply = _harness_clean(reply)
             if reply is not None:
                 return reply
         except Exception:
@@ -596,11 +645,23 @@ def ask_ai(prompt, history=None):
     api_key = load_api_key()
     if not api_key:
         return None
-    messages = [{"role": "system", "content": _system_prompt()}]
-    if history:
-        messages.extend(list(history)[-10:])
-    if (not messages or messages[-1].get("content") != prompt
-            or messages[-1].get("role") != "user"):
+    # Harness layer: prompt_harness.build_messages crafts the system
+    # persona, context block and trimmed history. Fall back to the legacy
+    # message assembly if the module is unavailable.
+    hist = list(history) if history else []
+    if (hist and hist[-1].get("role") == "user"
+            and hist[-1].get("content") == prompt):
+        hist = hist[:-1]
+    messages = None
+    try:
+        from prompt_harness import build_messages, classify_intent
+        messages = build_messages(prompt, history=hist,
+                                  intent=classify_intent(prompt))
+    except Exception:
+        messages = None
+    if not messages:
+        messages = [{"role": "system", "content": _system_prompt()}]
+        messages.extend(hist[-10:])
         messages.append({"role": "user", "content": prompt})
     payload = {
         "model": ACTIVE_MODEL,
@@ -639,7 +700,13 @@ def ask_ai(prompt, history=None):
                 # empty content; surface the reasoning text instead of nothing.
                 content = (data.get("choices") or [{}])[0].get("message", {}) \
                     .get("reasoning", "") or ""
-            return content.strip()
+            # Harness layer: normalize the reply (strip fences and social
+            # filler) before it reaches skills/UI. Fail-open to raw content.
+            try:
+                from prompt_harness import clean_reply
+                return clean_reply(content.strip()) or content.strip()
+            except Exception:
+                return content.strip()
         except requests.exceptions.Timeout:
             last_err = "request timed out"
             time.sleep(1)
@@ -828,6 +895,7 @@ def open_app(app_name):
 
 class JarvisApp:
     def __init__(self):
+        self._ui_thread_id = threading.get_ident()
         self.root = tk.Tk()
         self.root.title("J.A.R.V.I.S.")
         self.root.resizable(True, True)
@@ -1480,6 +1548,7 @@ class JarvisApp:
 
     def _continuous_listen_loop(self):
         self.ui_q.put(("status", "LISTENING"))
+        consecutive_failures = 0
         while self.continuous_listen:
             if self.speaking.is_set():
                 time.sleep(0.15)
@@ -1489,6 +1558,14 @@ class JarvisApp:
             try:
                 heard = self.listen(timeout=5, phrase_limit=8)
             except Exception as e:
+                consecutive_failures += 1
+                if consecutive_failures >= 5:
+                    self.continuous_listen = False
+                    self.ui_q.put(("auto_off", None))
+                    self.say("The microphone keeps failing, sir. "
+                             "Continuous listening is disabled; "
+                             "text commands still work.")
+                    break
                 self.ui_q.put(("sys", self._mic_error_message(e)))
                 time.sleep(1)
                 continue
@@ -1496,20 +1573,23 @@ class JarvisApp:
                 break
             if not (heard and heard.strip()):
                 continue
+            consecutive_failures = 0
             low = heard.strip().lower()
             if low == "stop" or "stop listening" in low:
                 self.continuous_listen = False
                 self.ui_q.put(("auto_off", None))
                 self.say("Continuous listening disabled, sir.")
                 break
-            if re.search(r"\b(goodbye|exit)\b", low):
-                self.say("Shutting down. It has been a pleasure, sir.")
-                self.running.clear()
-                self.ui_q.put(("shutdown", None))
-                return
             m = re.search(r"\b(?:hey\s+)?jarvis\b[,!.]?\s*(.*)$", low)
             if m:
                 cmd = m.group(1).strip(" .,")
+                # Only shut down when the wake word was used — ambient
+                # speech (TV, conversations) must never quit the app.
+                if re.search(r"\b(goodbye|exit|shut down|shutdown)\b", cmd):
+                    self.say("Shutting down. It has been a pleasure, sir.")
+                    self.running.clear()
+                    self.ui_q.put(("shutdown", None))
+                    return
                 if cmd:
                     self.ui_q.put(("sys", "You said: " + cmd))
                     self.ui_q.put(("entry_set", cmd))
@@ -1759,30 +1839,36 @@ class JarvisApp:
     def _animate(self):
         if not self.running.is_set():
             return  # app is shutting down; stop the animation loop cleanly
-        self._poll_queue()
-        if self.engine:
-            try:
-                self.engine.iterate()
-            except Exception:
-                pass
-            self._tts_tick()
+        try:
+            self._poll_queue()
+            if self.engine:
+                try:
+                    self.engine.iterate()
+                except Exception:
+                    pass
+                self._tts_tick()
 
-        self.t += 1
-        amp, speed = MODE_PARAMS[self._mode()]
-        self.pulse_amp = amp
-        self.spin = (self.spin + speed) % 360
+            self.t += 1
+            amp, speed = MODE_PARAMS[self._mode()]
+            self.pulse_amp = amp
+            self.spin = (self.spin + speed) % 360
 
-        self._draw_reactor()
-        self._draw_wave()
-        self._draw_bars()
-        self._draw_dot()
-        self._draw_dock()
-        self._draw_scan()
-        self._tick_mic_blink()
-        if self.booting:
-            self._draw_boot()
-        self._update_clock()
-        self._typing_tick()
+            self._draw_reactor()
+            self._draw_wave()
+            self._draw_bars()
+            self._draw_dot()
+            self._draw_dock()
+            self._draw_scan()
+            self._tick_mic_blink()
+            if self.booting:
+                self._draw_boot()
+            self._update_clock()
+            self._typing_tick()
+        except Exception:
+            # One bad frame must never kill this loop: the UI queue pump and
+            # typing ticker live here, and their death would leave every
+            # say() blocked at the speech_done wait.
+            pass
         self.root.after(30, self._animate)
 
     def _tts_tick(self):
@@ -1925,6 +2011,7 @@ class JarvisApp:
             self._typing = [who, text, 0]
             return
         who, text, idx = self._typing
+        text = text if isinstance(text, str) else ""
         chunk = text[idx:idx + 4]
         if chunk:
             self.tx.config(state="normal")
@@ -2004,6 +2091,8 @@ class JarvisApp:
             text="%02d:%02d:%02d" % (secs // 3600, (secs % 3600) // 60, secs % 60))
 
     def say(self, text):
+        if text is None:
+            text = ""
         print("JARVIS:", text)
         self.ui_q.put(("say", text))
         self.speech_done.clear()
@@ -2012,9 +2101,15 @@ class JarvisApp:
             return
         if self.engine is None and platform.system() != "Darwin":
             self.speech_done.set()
-        else:
-            threading.Thread(target=self._watch_for_interrupt, daemon=True).start()
-            self.speech_done.wait(timeout=120)
+            return
+        if threading.get_ident() == getattr(self, "_ui_thread_id", None):
+            # Called from the Tk main thread (button handlers, timers): the
+            # animation pump that sets speech_done runs on this very thread,
+            # so waiting here would deadlock the UI for up to 120 s. The
+            # pump plays the speech as soon as it processes the queue.
+            return
+        threading.Thread(target=self._watch_for_interrupt, daemon=True).start()
+        self.speech_done.wait(timeout=120)
 
     def _say_cited(self, answer, sources):
         """Speak an answer and show its sources in the transcript (not spoken)."""
@@ -2069,6 +2164,10 @@ class JarvisApp:
                     if fast:
                         self._cached_energy = r.energy_threshold
                 audio = r.listen(source, timeout=timeout, phrase_time_limit=phrase_limit)
+        except sr.WaitTimeoutError:
+            # Normal silence within the timeout window — not a microphone
+            # problem, so stay quiet instead of spamming the transcript.
+            return ""
         except Exception as e:
             msg = self._mic_error_message(e)
             if msg != getattr(self, "_last_mic_err", None):
@@ -2418,6 +2517,18 @@ class JarvisApp:
             code = re.sub(r"^```\w*\n?", "", code)
             code = re.sub(r"\n?```$", "", code)
         code = self._strip_code_chatter(code)
+        if not code or code.lower().startswith("i can generate code locally"):
+            self.say("I could not generate valid code for that, sir. "
+                     "Nothing was saved to " + filename + ".")
+            return
+        if filename.endswith(".py"):
+            try:
+                compile(code, filename, "exec")
+            except SyntaxError as e:
+                self.say(f"The generated code failed validation "
+                         f"(line {e.lineno}: {e.msg}), sir. Nothing was "
+                         f"saved to {filename}.")
+                return
         try:
             filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
             with open(filepath, "w", encoding="utf-8") as f:
@@ -3581,8 +3692,13 @@ class JarvisApp:
             self._handle_fix_screen(cmd)
             return
 
-        # Screen queries
-        if any(w in cmd for w in ["what's on my screen", "read my screen",
+        # Screen queries (vision). A screenshot with a destination —
+        # "screenshot to ~/x.png" — is a file-save request, not a screen
+        # question; the file-saver below handles it.
+        _wants_shot_file = bool(re.search(
+            r"\bscreenshot\b[^\n]*\b(?:to|into)\s+\S"
+            r"|\b(?:save|store)\b[^\n]*\bscreenshot\b", cmd))
+        if not _wants_shot_file and any(w in cmd for w in ["what's on my screen", "read my screen",
                                    "what is on my screen", "describe my screen",
                                    "screenshot", "what do you see",
                                    "what's on the screen"]):
@@ -4014,6 +4130,19 @@ class JarvisApp:
 
         # Local brain couldn't handle it — use Groq
         reply = ask_ai(prompt, list(self.history))
+        if reply is None or reply in ("__UNAUTHORIZED__", "__RATE_LIMITED__"):
+            # Resilience: Groq dead/keyless/rate-limited (the daily quota
+            # killer). If a GEMINI_API_KEY is set, answer via Gemini instead.
+            try:
+                from llm_client import chat_anywhere
+                gem = chat_anywhere(prompt, history=list(self.history),
+                                    system=_system_prompt(), chain=("google",))
+            except Exception:
+                gem = None
+            if gem:
+                gem = _harness_clean(gem)
+                self._set_ai_mode("ONLINE")
+                return gem
         if reply is None:
             return local or None
         if reply == "__UNAUTHORIZED__":
@@ -4201,7 +4330,7 @@ class JarvisApp:
         if not loc:
             self.ui_q.put(("status", "THINKING"))
             reply = self._ask_ai_safely(
-                f"What is the weather? Answer in one short sentence.")
+                "What is the weather? Answer in one short sentence.")
             if reply and reply != "__UNAUTHORIZED__":
                 self.say(reply)
             return
@@ -4536,9 +4665,17 @@ class JarvisApp:
 
         if re.search(r"\btake\s+a?\s*screenshot\b", cmd) or \
                 re.search(r"\b(screen\s+)?capture\b", cmd) or cmd.strip() == "screenshot":
-            path = os.path.join(
-                os.path.expanduser("~"), "Desktop",
-                "Jarvis_Screenshot_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".png")
+            mdest = re.search(r"\bto\s+([~/.][^\s]+)", cmd)
+            if mdest:
+                path = os.path.expanduser(mdest.group(1))
+                dest_dir = os.path.dirname(path)
+                if dest_dir and not os.path.isdir(dest_dir):
+                    self.say(f"I cannot save there, sir — {dest_dir} does not exist.")
+                    return True
+            else:
+                path = os.path.join(
+                    os.path.expanduser("~"), "Desktop",
+                    "Jarvis_Screenshot_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".png")
             try:
                 r = subprocess.run(["screencapture", "-x", path],
                                    capture_output=True, timeout=15)
@@ -4546,7 +4683,7 @@ class JarvisApp:
             except Exception:
                 ok = False
             if ok:
-                self.say("Screenshot saved to your desktop, sir.")
+                self.say(f"Screenshot saved to {path}, sir.")
             else:
                 self.say("I could not take a screenshot, sir. I may need "
                          "screen recording permission.")
@@ -4621,7 +4758,13 @@ class JarvisApp:
                 self._osascript(f"set volume output volume {nv}")
                 self.say(f"Volume set to {nv} percent, sir.")
                 return True
-            self.say("I can adjust the volume if you say make it louder or quieter, sir.")
+            mvol = re.search(r"\bvolume\s+(?:to\s+|level\s+)?(\d{1,3})\b", cmd)
+            if mvol:
+                nv = max(0, min(100, int(mvol.group(1))))
+                self._osascript(f"set volume output volume {nv}")
+                self.say(f"Volume set to {nv} percent, sir.")
+                return True
+            self.say("I can adjust the volume if you say make it louder, quieter, or set volume to a number, sir.")
             return True
 
         return False
@@ -5160,55 +5303,68 @@ class JarvisApp:
     def _sleep_loop(self):
         self.ui_q.put(("status", "SLEEP"))
         while self.running.is_set() and not self.awake:
-            text = self.listen(timeout=5, phrase_limit=6)
-            if not text:
-                # listen() returns instantly when no mic exists; without a
-                # pause this loop busy-spins one core at 100%.
-                time.sleep(0.2)
-                continue
-            print("YOU (wake):", text)
-            self.ui_q.put(("you", text))
-            # In sleep mode any utterance addressing JARVIS by name wakes him.
-            if not (self._is_wake_command(text) or "jarvis" in text):
-                continue
-            self.awake = True
-            self.ui_q.put(("awake", None))
-            rest = re.sub(r"\bwake up\b|\bwakeup\b|\bjarvis\b", " ", text)
-            rest = re.sub(r"\s+", " ", rest).strip(" .,")
-            if rest:
-                self.say("Yes sir, at your service.")
-                time.sleep(0.4)
-                self.process(rest)
-            else:
-                self.say("Yes sir, I am awake. Now proceed.")
-                time.sleep(0.6)
-            return
+            try:
+                text = self.listen(timeout=5, phrase_limit=6)
+                if not text:
+                    # listen() returns instantly when no mic exists; without a
+                    # pause this loop busy-spins one core at 100%.
+                    time.sleep(0.2)
+                    continue
+                print("YOU (wake):", text)
+                self.ui_q.put(("you", text))
+                # In sleep mode any utterance addressing JARVIS by name wakes him.
+                if not (self._is_wake_command(text) or "jarvis" in text):
+                    continue
+                self.awake = True
+                self.ui_q.put(("awake", None))
+                rest = re.sub(r"\bwake up\b|\bwakeup\b|\bjarvis\b", " ", text)
+                rest = re.sub(r"\s+", " ", rest).strip(" .,")
+                if rest:
+                    self.say("Yes sir, at your service.")
+                    time.sleep(0.4)
+                    self.process(rest)
+                else:
+                    self.say("Yes sir, I am awake. Now proceed.")
+                    time.sleep(0.6)
+                return
+            except Exception as e:
+                # A transient audio/tool failure must never silently kill the
+                # always-on wake engine.
+                print("SLEEP LOOP ERROR:", e)
+                time.sleep(0.5)
 
     def _awake_loop(self):
         self.ui_q.put(("status", "STANDBY"))
         while self.running.is_set() and self.awake:
             self.ui_q.put(("status", "LISTENING"))
-            text = self.listen(timeout=6, phrase_limit=10)
-            if not text:
+            try:
+                text = self.listen(timeout=6, phrase_limit=10)
+                if not text:
+                    self.ui_q.put(("status", "STANDBY"))
+                    time.sleep(0.2)  # avoid busy-spin when mic fails instantly
+                    continue
+                print("YOU:", text)
+                self.ui_q.put(("you", text))
+                text = text.replace("jarvis", " ").strip()
+                if not text:
+                    continue
+                if self._is_exit(text):
+                    self.say("Shutting down. It has been a pleasure, sir.")
+                    self.ui_q.put(("shutdown", None))
+                    self.running.clear()
+                    return
+                if self._is_sleep_command(text):
+                    self.awake = False
+                    self.ui_q.put(("sleep", None))
+                    self.say("Entering standby, sir. Say wake up jarvis when you need me.")
+                    time.sleep(0.6)
+                    return
+            except Exception as e:
+                # Keep the voice engine alive through transient audio errors.
+                print("AWAKE LOOP ERROR:", e)
                 self.ui_q.put(("status", "STANDBY"))
-                time.sleep(0.2)  # avoid busy-spin when mic fails instantly
+                time.sleep(0.5)
                 continue
-            print("YOU:", text)
-            self.ui_q.put(("you", text))
-            text = text.replace("jarvis", " ").strip()
-            if not text:
-                continue
-            if self._is_exit(text):
-                self.say("Shutting down. It has been a pleasure, sir.")
-                self.ui_q.put(("shutdown", None))
-                self.running.clear()
-                return
-            if self._is_sleep_command(text):
-                self.awake = False
-                self.ui_q.put(("sleep", None))
-                self.say("Entering standby, sir. Say wake up jarvis when you need me.")
-                time.sleep(0.6)
-                return
             try:
                 self.process(text)
             except Exception as e:
@@ -6098,9 +6254,36 @@ class JarvisBot:
             return True
         if re.search(r"\btake\s+a?\s*screenshot\b", cmd) or \
                 re.search(r"\b(screen\s+)?capture\b", cmd) or cmd.strip() == "screenshot":
-            self._handle_screen_query(cmd)
+            mdest = re.search(r"\bto\s+([~/.][^\s]+)", cmd)
+            if mdest:
+                bpath = os.path.expanduser(mdest.group(1))
+                bdest_dir = os.path.dirname(bpath)
+                if bdest_dir and not os.path.isdir(bdest_dir):
+                    self.say(f"I cannot save there, sir — {bdest_dir} does not exist.")
+                    return True
+            else:
+                bpath = os.path.join(
+                    os.path.expanduser("~"), "Desktop",
+                    "Jarvis_Screenshot_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S") + ".png")
+            try:
+                r = subprocess.run(["screencapture", "-x", bpath],
+                                   capture_output=True, timeout=15)
+                bok = r.returncode == 0 and os.path.exists(bpath)
+            except Exception:
+                bok = False
+            if bok:
+                self.say(f"Screenshot saved to {bpath}, sir.")
+            else:
+                self.say("I could not take a screenshot, sir. I may need "
+                         "screen recording permission.")
             return True
         if re.search(r"\bvolume\b", cmd):
+            mvol = re.search(r"\bvolume\s+(?:to\s+|level\s+)?(\d{1,3})\b", cmd)
+            if mvol:
+                nv = max(0, min(100, int(mvol.group(1))))
+                self._osascript(f"set volume output volume {nv}")
+                self.say(f"Volume set to {nv} percent, sir.")
+                return True
             if re.search(r"\b(max|full|louder|increase|up)\b", cmd):
                 cur = self._current_volume()
                 nv = min(100, (cur + 10) if cur is not None else 80)
@@ -6235,6 +6418,20 @@ class JarvisBot:
         if local:
             return local
         reply = ask_ai(prompt, self._bot_context_history())
+        if reply is None or reply in ("__UNAUTHORIZED__", "__RATE_LIMITED__"):
+            # Resilience: Groq dead/keyless/rate-limited. When a
+            # GEMINI_API_KEY is set, answer via Gemini instead.
+            try:
+                from llm_client import chat_anywhere
+                gem = chat_anywhere(
+                    prompt, history=self._bot_context_history(),
+                    system=_system_prompt(), chain=("google",))
+            except Exception:
+                gem = None
+            if gem:
+                gem = _harness_clean(gem)
+                self._set_ai_mode("ONLINE")
+                return gem
         if reply is None:
             return local or None
         if reply == "__UNAUTHORIZED__":
@@ -6564,13 +6761,20 @@ class JarvisBot:
         if not b64:
             self.say("Could not capture screen.")
             return
-        
-        prompt = f"Previous conversation:\n{context}\n\nUser request: {cmd}\n\nCurrent screen screenshot attached. What action should be taken?"
+
         if context:
+            prompt = (f"Previous conversation:\n{context}\n\n"
+                      f"User request: {cmd}\n\n"
+                      "Current screen screenshot attached. Is there an error, "
+                      "warning, bug, or issue visible? Describe exactly what "
+                      "needs fixing; if nothing needs fixing, say 'No issues'.")
             analysis = self._ask_vision(b64, prompt)
+            if not analysis or analysis == "__UNAUTHORIZED__":
+                self.say("I need an API key for vision, sir. Say 'set api key'.")
+                return
+            self.say(f"Based on our conversation and your screen: {analysis}")
         else:
-            analysis = self._handle_fix_screen(cmd)
-            return
+            self._handle_fix_screen(cmd)
 
     # ================================================================
     # JarvisApp feature-parity helpers
@@ -7273,6 +7477,18 @@ class JarvisBot:
             code = re.sub(r"^```\w*\n?", "", code)
             code = re.sub(r"\n?```$", "", code)
         code = self._strip_code_chatter(code)
+        if not code or code.lower().startswith("i can generate code locally"):
+            self.say("I could not generate valid code for that, sir. "
+                     "Nothing was saved to " + filename + ".")
+            return
+        if filename.endswith(".py"):
+            try:
+                compile(code, filename, "exec")
+            except SyntaxError as e:
+                self.say(f"The generated code failed validation "
+                         f"(line {e.lineno}: {e.msg}), sir. Nothing was "
+                         f"saved to {filename}.")
+                return
         try:
             filepath = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
             with open(filepath, "w", encoding="utf-8") as f:
@@ -7837,7 +8053,12 @@ class JarvisBot:
                 return
 
             # Screen queries
-            if any(w in cmd_lower for w in ["what's on my screen", "what is on my screen",
+            # A screenshot with a destination is a file-save request, not a
+            # screen question; the file-saver handler deals with it.
+            _wants_shot_file = bool(re.search(
+                r"\bscreenshot\b[^\n]*\b(?:to|into)\s+\S"
+                r"|\b(?:save|store)\b[^\n]*\bscreenshot\b", cmd))
+            if not _wants_shot_file and any(w in cmd_lower for w in ["what's on my screen", "what is on my screen",
                                              "read my screen", "see my screen",
                                              "what am i looking at", "look at my screen",
                                              "screenshot", "take a screenshot",
