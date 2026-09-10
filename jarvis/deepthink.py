@@ -322,6 +322,10 @@ def _solve_transform(text: str) -> Optional[str]:
                                        f"= {_fmt(value)}")
             elif kind in ("plus", "minus", "times"):
                 pending = {"plus": "+", "minus": "-", "times": "*"}[kind]
+        # Unconsumed operator ("... then add 5" with no later number) means
+        # the expression is under-specified; decline rather than drop it.
+        if pending is not None:
+            return None
         return value
 
     steps: list[str] = []

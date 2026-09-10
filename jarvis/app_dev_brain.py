@@ -26,6 +26,7 @@ import os
 import platform
 import re
 import subprocess
+from urllib.parse import quote
 
 try:
     from jarvis_logging import get_logger
@@ -50,6 +51,7 @@ PROJECT_DIR = os.path.dirname(_HERE) if os.path.isfile(
     os.path.join(os.path.dirname(_HERE), "main.py")) else _HERE
 GENERATED_APPS_DIR = os.path.join(PROJECT_DIR, "generated_apps")
 AISTUDIO_URL = "https://aistudio.google.com/"
+AISTUDIO_BUILD_URL = "https://aistudio.google.com/apps?prompt="
 
 
 # ==========================================================================
@@ -84,17 +86,32 @@ def _open(url: str) -> bool:
         return False
 
 
-def _apps_root() -> str:
-    """Root directory for generated apps (module attr so tests can patch)."""
-    return GENERATED_APPS_DIR
+def _aistudio_build_url(prompt: str, is_app: bool = False) -> str:
+    """Pre-filled Google AI Studio 'New app' link for the given prompt.
+
+    Mirrors main.aistudio_build_url so this module never needs to import main.
+    The prompt rides as a URL parameter, dropping the user straight onto the
+    build screen with the prompt box already populated.
+    """
+    q = quote((prompt or "").strip())
+    url = AISTUDIO_BUILD_URL + q
+    if is_app:
+        url += "&features=build_android_app"
+    return url
 
 
 def _handoff_to_aistudio(prompt: str) -> bool:
-    """Copy the Groq prompt to the clipboard and open Google AI Studio."""
+    """Copy the prompt to the clipboard and open Google AI Studio's build
+    screen with the prompt pre-filled."""
     copied = _copy(prompt)
-    opened = bool(copied and _open(AISTUDIO_URL))
+    opened = bool(copied and _open(_aistudio_build_url(prompt)))
     log.info("aistudio handoff: copied=%s opened=%s", copied, opened)
     return opened
+
+
+def _apps_root() -> str:
+    """Root directory for generated apps (module attr so tests can patch)."""
+    return GENERATED_APPS_DIR
 
 
 # ==========================================================================
@@ -611,6 +628,15 @@ def _groq_prompt(kind_label: str, topic: str) -> str:
         % (kind_label, topic))
 
 
+_AISTUDIO_META = (
+    "Write a single detailed prompt to paste into Google AI Studio so Gemini "
+    "creates a polished %s about \"%s\". The prompt must request a complete, "
+    "production-ready result with a modern structure, embedded styling, and "
+    "professional polish. Output ONLY the prompt text itself, no quotes, no "
+    "code fences, no explanation."
+)
+
+
 # ==========================================================================
 # Executor core (two paths: local templates OR aistudio handoff)
 # ==========================================================================
@@ -631,21 +657,24 @@ def _execute_scaffold(app, ctx) -> str:
 
     slug = _slugify(topic)
 
-    # Path 2 (online): Groq available -> craft prompt, clipboard, AI Studio.
-    groq_prompt = _groq_prompt(label, topic)
-    reply = None
+    # Path 2 (online): Groq crafts the AI Studio prompt -> the prompt (not a
+    # discarded probe) is copied and dropped into the pre-filled build screen.
+    crafted = None
     try:
-        reply = _llm(app, groq_prompt)
+        crafted = _llm(app, _AISTUDIO_META % (label, topic))
     except Exception as exc:  # defensive: never let LLM seams explode
-        log.warning("_llm probe failed: %s", exc)
-        reply = None
-    if reply:
-        if _handoff_to_aistudio(groq_prompt):
-            return ("My Groq brain is standing by, so I put a complete %s "
-                    "build prompt on your clipboard and opened Google AI "
-                    "Studio. Paste it into the prompt box to generate the "
-                    "code, then drop the files into generated_apps/%s/"
-                    % (label, slug))
+        log.warning("_llm craft failed: %s", exc)
+        crafted = None
+    if crafted and str(crafted).strip():
+        prompt = str(crafted).strip().strip('"').strip("'")
+        if len(prompt) < 24:  # too thin to be a real drafted prompt
+            prompt = _groq_prompt(label, topic)
+        if _handoff_to_aistudio(prompt):
+            return ("My Groq brain drafted a complete %s build prompt for '%s' "
+                    "and placed it straight into Google AI Studio's build "
+                    "screen, sir. Hit run, and drop the files into "
+                    "generated_apps/%s/"
+                    % (label, topic, slug))
         log.info("aistudio handoff unavailable; using local template")
 
     # Path 1 (local): complete offline template tree under generated_apps/.

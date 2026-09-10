@@ -12,6 +12,7 @@ import os
 import platform
 import re
 import subprocess
+from urllib.parse import quote
 
 from jarvis_logging import get_logger
 from brain import _llm
@@ -23,6 +24,7 @@ PROJECT_DIR = os.path.dirname(_HERE) if os.path.isfile(
     os.path.join(os.path.dirname(_HERE), "main.py")) else _HERE
 GENERATED_DIR = os.path.join(PROJECT_DIR, "generated_websites")
 AI_STUDIO_URL = "https://aistudio.google.com/"
+AI_STUDIO_BUILD_URL = "https://aistudio.google.com/apps?prompt="
 
 
 def _clean_topic(raw):
@@ -116,16 +118,24 @@ def _open_in_browser(path):
         return False
 
 
-def _open_ai_studio():
+def _open_ai_studio(prompt=None):
+    """Open AI Studio's pre-filled build screen for the prompt, if any."""
+    url = (AI_STUDIO_BUILD_URL + quote((prompt or "").strip())
+           if prompt else AI_STUDIO_URL)
     try:
         if platform.system() == "Darwin":
-            subprocess.run(["open", AI_STUDIO_URL], check=False)
+            subprocess.run(["open", url], check=False)
             return True
         import webbrowser
-        return bool(webbrowser.open(AI_STUDIO_URL))
+        return bool(webbrowser.open(url))
     except Exception:
         log.exception("AI Studio open failed")
         return False
+
+
+def _aistudio_build_url(prompt: str) -> str:
+    """Pre-filled Google AI Studio 'New app' link (no main import needed)."""
+    return AI_STUDIO_BUILD_URL + quote((prompt or "").strip())
 
 
 _META_TMPL = (
@@ -145,17 +155,17 @@ def _try_handoff(app, kind_label, topic):
     if not prompt:
         return None
     copied = _copy_clipboard(prompt)
-    opened = _open_ai_studio()
-    head = ("Sir, I've drafted a %s prompt for \"%s\"" % (kind_label, topic))
+    opened = _open_ai_studio(prompt)
+    head = ("Sir, I've drafted a %s prompt for \"%s\" and dropped it into "
+            "Google AI Studio's build screen" % (kind_label, topic))
     if copied:
-        msg = (head + " and copied it to your clipboard. Google AI Studio is "
-               "opening now, sir — paste the prompt into the chat box and "
-               "press Enter.")
+        msg = (head + ", sir. It is also on your clipboard as a back-up.")
     else:
-        msg = (head + ", though my clipboard charm misfired, sir. Google AI "
-               "Studio is opening — here is the prompt:\n\n" + prompt)
+        msg = (head + ", sir. Here is the prompt for your own pasting:\n\n"
+               + prompt)
     if not opened:
-        msg += "\n(Do open https://aistudio.google.com/ manually, sir.)"
+        msg += ("\n(Do open %s manually, sir.)"
+                % (AI_STUDIO_BUILD_URL + "YOUR-PROMPT"))
     return msg
 
 

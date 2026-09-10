@@ -253,11 +253,29 @@ def test_handoff_when_llm_available(env, brain, monkeypatch):
     prompt = env["copied"][0]
     assert "tea inventory" in prompt
     assert "Flask REST API" in prompt
-    assert env["opened"] == [adb.AISTUDIO_URL]
+    assert len(env["opened"]) == 1
+    assert env["opened"][0].startswith(adb.AISTUDIO_BUILD_URL)
+    # the prompt is URL-encoded into the deep link, not raw
+    assert "tea%20inventory" in env["opened"][0]
     assert "Google AI Studio" in reply
     assert reply.endswith(", sir.")
     # handoff writes nothing locally
     assert not env["apps"].exists() or not list(env["apps"].iterdir())
+
+
+def test_handoff_deep_link_prefills_the_drafted_prompt(env, brain,
+                                                      monkeypatch):
+    drafted = ("Create a polished Flask REST API about book lending with an "
+               "items endpoint, embedded documentation, and a clean layout.")
+    monkeypatch.setattr(adb, "_llm", lambda app, prompt: drafted)
+    invoke(brain, "flask api for book lending")
+    url = env["opened"][0]
+    assert url.startswith(adb.AISTUDIO_BUILD_URL)
+    from urllib.parse import parse_qs, urlparse
+    params = parse_qs(urlparse(url).query)
+    assert params.get("prompt", [""])[0] == "Create a polished Flask REST API about book lending with an items endpoint, embedded documentation, and a clean layout."
+    # the LLM-crafted prompt (not the static brief) is what gets handed off
+    assert env["copied"][0] == drafted
 
 
 def test_handoff_prompt_is_full_engineering_brief(env, brain, monkeypatch):
@@ -289,6 +307,16 @@ def test_handoff_to_aistudio_helper_truth_table(monkeypatch):
     assert adb._handoff_to_aistudio("prompt") is True
     monkeypatch.setattr(adb, "_open", lambda u: False)
     assert adb._handoff_to_aistudio("prompt") is False
+
+
+def test_aistudio_build_url_encodes_prompt():
+    url = adb._aistudio_build_url("flask api for stock levels & reports")
+    assert url.startswith(adb.AISTUDIO_BUILD_URL)
+    assert "&amp;" not in url
+    assert "stock%20levels" in url and "%26%20reports" in url.replace("&amp;", "%26")
+    assert "&features=" not in url
+    app_url = adb._aistudio_build_url("a", is_app=True)
+    assert app_url.endswith("&features=build_android_app")
 
 
 def test_llm_probe_failure_still_scaffolds_locally(env, brain,

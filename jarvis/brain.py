@@ -374,6 +374,19 @@ class Brain:
                 return reasoned
         except Exception:
             pass
+        # Gemini planning layer: hard, multi-step questions (comparisons,
+        # trade-offs, plans) go to Gemini when a key is configured, BEFORE
+        # the generic local brain and the fast Groq path. Falls through
+        # silently when no GEMINI_API_KEY is set or the text is not a
+        # hard problem.
+        try:
+            from llm_client import planner_reply
+            planned = planner_reply(text)
+            if planned:
+                self._log_reply(planned)
+                return planned
+        except Exception:
+            pass
         try:
             from brain_extra import local_chat
             reply = local_chat(self, text, _code_gen_mode=_code_gen_mode)
@@ -728,6 +741,10 @@ class Brain:
         return None
 
     def _currency_detect(self, cmd):
+        # Regex testing/explain phrases contain literal "$" and currency-like
+        # tokens; they belong to the regex skills, not the converter.
+        if re.search(r"\bregex(?:p|es)?\b", cmd, re.I):
+            return None
         found = []
         for key, code in CURRENCY_ALIAS.items():
             if key.isalpha():

@@ -268,7 +268,6 @@ ELEMENTS = {
     "oxygen": ("O", 8, 15.999, "essential for breathing, 21% of the air"),
     "sodium": ("Na", 11, 22.99, "half of table salt; violently reacts "
                "with water"),
-    "aluminium": ("Al", 13, 26.98, "the most abundant metal in Earth's crust"),
     "aluminum": ("Al", 13, 26.98, "the most abundant metal in Earth's crust"),
     "silicon": ("Si", 14, 28.085, "the backbone of computer chips"),
     "phosphorus": ("P", 15, 30.974, "glows in the dark; needed for DNA"),
@@ -292,7 +291,6 @@ ELEMENTS = {
     "chromium": ("Cr", 24, 51.996, "gives stainless steel its shine"),
     "manganese": ("Mn", 25, 54.938, "essential for making steel"),
     "cobalt": ("Co", 27, 58.933, "gives blue color to glass"),
-    "arsenic": ("As", 33, 74.922, "famous poison; also used in electronics"),
     "bromine": ("Br", 35, 79.904, "one of only two elements liquid at room "
                 "temperature"),
     "tin": ("Sn", 50, 118.71, "used to make bronze and solder"),
@@ -484,8 +482,6 @@ CONCEPTS = {
                   "strong that nothing, not even light, can escape it",
     "gravity": "the force that pulls objects with mass toward each other",
     "dna": "the molecule that carries the genetic instructions for life",
-    "photosynthesis": "how plants turn sunlight, water, and carbon dioxide "
-                      "into food and oxygen",
     "quantum": "the world of atoms and particles, where energy comes in "
                "tiny, fixed packets",
     "internet": "a global network of computers connected so they can share "
@@ -496,8 +492,6 @@ CONCEPTS = {
     "cloud": "computers and services you use over the internet instead of "
              "on your own machine",
     "encryption": "scrambling data so only the right key can read it",
-    "machine learning": "teaching computers to learn patterns from data "
-                        "instead of explicit instructions",
     "gpt": "a language model trained to predict and generate human-like "
            "text",
     "romance": "romantic love, or stories about it",
@@ -508,8 +502,6 @@ CONCEPTS = {
     "psychology": "the scientific study of the mind and behavior",
     "history": "the record of past events and how they shaped today",
     "metaverse": "a shared virtual world where people can interact",
-    "blockchain": "a shared digital ledger that records transactions "
-                  "securely",
     "crypto": "digital money that uses cryptography to secure transactions",
     "big bang": "the event about 13.8 billion years ago when the universe "
                 "began expanding",
@@ -745,9 +737,6 @@ EVENTS = {
                              "around 1760, sir.",
     "french revolution": "the French Revolution began in 1789, sir.",
     "american revolution": "the American Revolution began in 1775, sir.",
-    "indian independence": "India gained independence on August 15, 1947, "
-                           "sir.",
-    "fall of berlin wall": "the Berlin Wall fell on November 9, 1989, sir.",
     "covid pandemic": "COVID-19 became a global pandemic in early 2020, "
                       "sir.",
     "smartphone invented": "the first iPhone launched in 2007, sir.",
@@ -3799,12 +3788,6 @@ def register_extra(brain):
         return ("%s out of %s is %s percent, sir."
                 % (_fmt(got), _fmt(total), _fmt(round(pct, 2))))
 
-    def _score_pct_detect(cmd):
-        if re.search(r"\b(?:out\s+of|percent of the total)\b", cmd,
-                     re.I) and len(_nums(cmd)) >= 2:
-            return {"cmd": cmd}
-        return None
-
     def _grade_fn(app, cmd):
         nums = _nums(cmd)
         if len(nums) < 2:
@@ -4651,7 +4634,7 @@ def register_extra(brain):
         text = re.sub(r".*(?:morse|morse code)\s*(?:decode|interpret|translate)?\s*", "", cmd, flags=re.I).strip()
         if not text:
             return "What Morse code should I decode, sir?"
-        morse_map = {'.-':'A','-...':'B','-.-.':'C','-..':'D','.':'E','..-.':'F','--.':'G','....':'H','..':'I','.--':'J','-.-':'K','.-..':'L','--':'M','-.':'N','---':'O','.--.':'P','--.-':'Q','.-.':'R','...':'S','-':'T','..-':'U','...-':'V','.--':'W','-..-':'X','-.--':'Y','--..':'Z','-----':'0','.----':'1','..---':'2','...--':'3','....-':'4','.....':'5','-....':'6','--...':'7','---..':'8','----.':'9','/':' '}
+        morse_map = {'.-':'A','-...':'B','-.-.':'C','-..':'D','.':'E','..-.':'F','--.':'G','....':'H','..':'I','.---':'J','-.-':'K','.-..':'L','--':'M','-.':'N','---':'O','.--.':'P','--.-':'Q','.-.':'R','...':'S','-':'T','..-':'U','...-':'V','.--':'W','-..-':'X','-.--':'Y','--..':'Z','-----':'0','.----':'1','..---':'2','...--':'3','....-':'4','.....':'5','-....':'6','--...':'7','---..':'8','----.':'9','/':' '}
         decoded = "".join(morse_map.get(code, "?") for code in text.split(" "))
         return "Decoded: %s" % decoded
     reg_fn("morse_decode", _morse_decode_detect, _morse_decode_fn)
@@ -5027,8 +5010,22 @@ def register_extra(brain):
 {{BODY}}
 </body>
 </html>"""
+    _RICH_WEB_PHRASES = (
+        "landing page", "portfolio site", "portfolio website", "portfolio",
+        "blog site", "blog", "dashboard ui", "admin dashboard", "dashboard",
+        "contact form page", "contact form", "feedback form",
+        "pwa scaffold", "progressive web app", "pwa",
+        "react component", "jsx component",
+        "tailwind page", "tailwind",
+    )
     def _build_webpage_detect(c):
-        return bool(re.search(r"\b(build|create|make|design|generate)\b.*\b(website|webpage|web page|web site|landing page|portfolio|blog)\b", c, re.I))
+        # Defer phrases the richer web_dev_brain skills handle; only claim
+        # generic "website" requests here so build_webpage's plain template
+        # never shadows the full landing/portfolio/blog/pwa scaffolder.
+        for phrase in _RICH_WEB_PHRASES:
+            if re.search(r"\b" + re.escape(phrase) + r"\b", c, re.I):
+                return False
+        return bool(re.search(r"\b(build|create|make|design|generate)\b.*\b(website|webpage|web page|web site)\b", c, re.I))
     def _build_webpage_fn(a, cmd):
         topic = re.sub(r".*(?:build|create|make|design|generate)\s+(?:a\s+)?(?:an\s+)?", "", cmd, flags=re.I)
         topic = re.sub(r"\s*(website|webpage|web page|web site|landing page|portfolio|blog)\b", "", topic, flags=re.I).strip()
@@ -5357,127 +5354,6 @@ def register_extra(brain):
     reg('what is dark energy', 'Energy accelerating universe expansion.')
     reg('what is higgs boson', 'Particle giving mass to others.')
     reg('what is large hadron collider', 'World\'s largest particle accelerator.')
-    reg('what is blockchain', 'A distributed, decentralized public ledger.')
-    reg('what is cryptocurrency', 'Digital currency using cryptography and blockchain.')
-    reg('what is bitcoin', 'The first and most well-known cryptocurrency, created 2009.')
-    reg('what is ethereum', 'A decentralized platform for smart contracts.')
-    reg('what is quantum computing', 'Computing using quantum-mechanical phenomena.')
-    reg('what is cloud computing', 'Computing services delivered over the internet.')
-    reg('what is cybersecurity', 'Protecting systems from digital attacks.')
-    reg('what is encryption', 'Converting data into coded format for security.')
-    reg('what is a firewall', 'A network security system monitoring traffic.')
-    reg('what is malware', 'Software designed to cause damage to computers.')
-    reg('what is phishing', 'Cyberattack using fraudulent emails to steal information.')
-    reg('what is hacking', 'Exploiting weaknesses in computer systems.')
-    reg('what is open source', 'Software with publicly accessible source code.')
-    reg('what is linux', 'A family of open-source Unix-like operating systems.')
-    reg('what is windows', 'Operating systems developed by Microsoft.')
-    reg('what is macos', 'Operating system by Apple for Mac computers.')
-    reg('what is python programming', 'A high-level, readable programming language.')
-    reg('what is javascript', 'Programming language for interactive web pages.')
-    reg('what is java', 'Object-oriented programming language.')
-    reg('what is c language', 'Influential general-purpose programming language.')
-    reg('what is c plus plus', 'Extension of C with object-oriented features.')
-    reg('what is rust programming', 'Systems language focused on safety and speed.')
-    reg('what is go programming', 'Statically typed language designed at Google.')
-    reg('what is swift programming', 'Language for Apple platforms.')
-    reg('what is kotlin', 'Cross-platform language with type inference.')
-    reg('what is typescript', 'Typed superset of JavaScript by Microsoft.')
-    reg('what is php', 'Scripting language for web development.')
-    reg('what is ruby', 'Dynamic language focused on simplicity.')
-    reg('what is sql', 'Language for managing relational databases.')
-    reg('what is nosql', 'Non-relational database management systems.')
-    reg('what is api', 'Application Programming Interface for software communication.')
-    reg('what is rest api', 'Architectural style for networked applications.')
-    reg('what is graphql', 'Query language for APIs.')
-    reg('what is websocket', 'Protocol for full-duplex communication over TCP.')
-    reg('what is http', 'HyperText Transfer Protocol for web data.')
-    reg('what is https', 'HTTP with TLS encryption for security.')
-    reg('what is tcp', 'Transmission Control Protocol for reliable data.')
-    reg('what is udp', 'User Datagram Protocol for fast data.')
-    reg('what is ip address', 'Unique label for devices on a network.')
-    reg('what is dns', 'Domain Name System translating names to IPs.')
-    reg('what is dhcp', 'Protocol for automatic IP assignment.')
-    reg('what is vpn', 'Virtual Private Network for secure connections.')
-    reg('what is ssh', 'Secure Shell for encrypted network access.')
-    reg('what is ftp', 'File Transfer Protocol for files.')
-    reg('what is smtp', 'Protocol for sending emails.')
-    reg('what is oauth', 'Token-based authentication standard.')
-    reg('what is json', 'JavaScript Object Notation -- lightweight data format.')
-    reg('what is xml', 'Extensible Markup Language for documents.')
-    reg('what is yaml', 'Human-readable data serialization.')
-    reg('what is csv', 'Comma-Separated Values for tabular data.')
-    reg('what is markdown', 'Lightweight markup for formatted text.')
-    reg('what is html5', 'Latest HTML standard for web content.')
-    reg('what is css3', 'Latest CSS for styling.')
-    reg('what is dom', 'Document Object Model for page structure.')
-    reg('what is react', 'JavaScript UI library by Meta.')
-    reg('what is vue', 'Progressive JavaScript framework.')
-    reg('what is angular', 'Framework for single-page applications.')
-    reg('what is node js', 'JavaScript runtime on Chrome V8.')
-    reg('what is django', 'High-level Python web framework.')
-    reg('what is flask', 'Lightweight Python web framework.')
-    reg('what is laravel', 'PHP web framework.')
-    reg('what is spring boot', 'Framework for Spring applications.')
-    reg('what is express js', 'Minimal Node.js web framework.')
-    reg('what is fastapi', 'Modern Python API framework.')
-    reg('what is docker', 'Platform for containerized apps.')
-    reg('what is kubernetes', 'Container orchestration platform.')
-    reg('what is ci cd', 'Continuous Integration / Continuous Deployment.')
-    reg('what is git', 'Distributed version control system.')
-    reg('what is github', 'Web platform for Git collaboration.')
-    reg('what is gitlab', 'DevOps platform with Git.')
-    reg('what is jenkins', 'Open-source automation server.')
-    reg('what is terraform', 'Infrastructure as code tool.')
-    reg('what is ansible', 'IT automation engine.')
-    reg('what is aws', 'Amazon Web Services cloud platform.')
-    reg('what is azure', 'Microsoft Azure cloud service.')
-    reg('what is gcp', 'Google Cloud Platform.')
-    reg('what is saas', 'Software as a Service.')
-    reg('what is paas', 'Platform as a Service.')
-    reg('what is iaas', 'Infrastructure as a Service.')
-    reg('what is edge computing', 'Computation near data sources.')
-    reg('what is serverless computing', 'Cloud model with managed infrastructure.')
-    reg('what is microservices', 'Architecture of small independent services.')
-    reg('what is monolith', 'All-in-one interconnected architecture.')
-    reg('what is devops', 'Combining development and IT operations.')
-    reg('what is agile', 'Iterative project management approach.')
-    reg('what is scrum', 'Agile framework using sprints.')
-    reg('what is kanban', 'Visual workflow management.')
-    reg('what is iot', 'Internet of Things -- connected devices.')
-    reg('what is augmented reality', 'Digital content overlaid on the real world.')
-    reg('what is virtual reality', 'Computer-generated 3D simulation.')
-    reg('what is mixed reality', 'Blend of physical and digital worlds.')
-    reg('what is computer vision', 'AI for interpreting visual information.')
-    reg('what is image recognition', 'AI identifying objects in images.')
-    reg('what is recommendation system', 'System suggesting products based on data.')
-    reg('what is reinforcement learning', 'Agent learning by taking actions.')
-    reg('what is supervised learning', 'ML trained on labeled data.')
-    reg('what is unsupervised learning', 'ML finding patterns without labels.')
-    reg('what is overfitting', 'Model performing poorly on new data.')
-    reg('what is gradient descent', 'Optimization minimizing loss function.')
-    reg('what is backpropagation', 'Algorithm for training neural networks.')
-    reg('what is accuracy', 'Ratio of correct predictions to total.')
-    reg('what is precision', 'True positive rate of predictions.')
-    reg('what is recall', 'True positive rate of actual positives.')
-    reg('what is f1 score', 'Harmonic mean of precision and recall.')
-    reg('what is confusion matrix', 'Table for evaluating classification.')
-    reg('what is cross validation', 'Assessing model generalization.')
-    reg('what is random forest', 'Ensemble of decision trees.')
-    reg('what is decision tree', 'Flowchart for classification.')
-    reg('what is support vector machine', 'Algorithm finding optimal class boundary.')
-    reg('what is k nearest neighbors', 'Classification based on nearest points.')
-    reg('what is k means clustering', 'Partitioning data into k clusters.')
-    reg('what is linear regression', 'Modeling variable relationships.')
-    reg('what is logistic regression', 'Model for binary classification.')
-    reg('what is hypothesis testing', 'Decisions based on sample data.')
-    reg('what is p value', 'Probability under the null hypothesis.')
-    reg('what is standard deviation', 'Measure of data dispersion.')
-    reg('what is normal distribution', 'Symmetric bell-shaped distribution.')
-    reg('what is chi square test', 'Test for categorical variable association.')
-    reg('what is t test', 'Comparing means of two groups.')
-    reg('what is pearson correlation', 'Linear correlation, -1 to 1.')
-    reg('what is anova', 'Comparing means of three or more groups.')
     reg('what is acceleration', 'Rate of velocity change over time.')
     reg('what is velocity', 'Rate of position change with direction.')
     reg('what is momentum', 'Product of mass and velocity.')
@@ -8194,6 +8070,11 @@ def local_chat(brain, text, _code_gen_mode=False):
                  r"\b(code|script|program|function|class|app|calculator|"
                  r"fibonacci|sorting|game|website|html|python|javascript|"
                  r"login|todo|chat|api|server|client)\b", t):
+        if _code_gen_mode:
+            # Explicit code-to-file requests must go to the LLM: the local
+            # template set is tiny and its fallback text is not code, so
+            # returning it here would save prose into the target file.
+            return None
         return _local_code_generate(t)
 
     # ── 12i. Summarize / TLDR ─────────────────────────────────────────

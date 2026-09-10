@@ -129,14 +129,23 @@ def test_auto_listen():
     app.say = lambda text: replies.append(text)
     app.listen = lambda *a, **k: "jarvis what time is it"
 
+    got = threading.Event()
+
+    def proof_listen(*a, **k):
+        got.set()  # loop only reaches listen() while continuous_listen is True
+        return "jarvis what time is it"
+
+    app.listen = proof_listen
+
     app._toggle_auto_listen()
-    check("auto flag on", app.continuous_listen is True)
     check("auto button armed", str(app.auto_listen_btn.cget("text")) == "AUTO")
+    check("auto flag on", got.wait(timeout=5))
 
     if app._listen_thread:
         app._listen_thread.join(timeout=10)
     drain(app)
 
+    check("auto loop stopped after command", app.continuous_listen is False)
     check("wake word stripped from heard command",
           captured == ["what time is it"], f"got {captured!r}")
 

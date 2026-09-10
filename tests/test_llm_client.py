@@ -6,7 +6,9 @@ import pytest
 import requests
 
 import llm_client
-from llm_client import LLMClient, PROVIDERS, active_provider, mask_key
+from llm_client import (LLMClient, PROVIDERS, active_provider, mask_key,
+                        provider_api_key, configure_gemini_key,
+                        gemini_configured)
 
 
 # --------------------------------------------------------------------------- #
@@ -48,8 +50,12 @@ class Recorder:
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
     for var in ("JARVIS_PROVIDER", "GROQ_API_KEY",
-                "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+                "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+                llm_client.GEMINI_API_KEY_ENV):
         monkeypatch.delenv(var, raising=False)
+    # Never let a real on-disk Gemini key leak into tests.
+    monkeypatch.setattr(llm_client, "_GEMINI_KEY_FILE",
+                        "/nonexistent/jarvis/.jarvis_gemini_key")
 
 
 @pytest.fixture(autouse=True)
@@ -63,7 +69,7 @@ def install(monkeypatch, replies=None):
     return rec
 
 
-KEYED = ("groq", "openai", "anthropic")
+KEYED = ("groq", "openai", "anthropic", "google")
 
 
 # --------------------------------------------------------------------------- #
@@ -267,12 +273,29 @@ def test_openai_parses_choices_and_reasoning_fallback(monkeypatch):
     assert LLMClient(provider=PROVIDERS["groq"]).chat("q") == "hmm"
 
 
-def test_empty_content_yields_empty_string(monkeypatch):
+def test_empty_content_yields_none(monkeypatch):
     install(monkeypatch, [FakeResp(200, {"choices": [{"message": {"content": "  "}}]})])
     monkeypatch.setenv("GROQ_API_KEY", "sk-test-9876zyxw")
     client = LLMClient(provider=PROVIDERS["groq"])
-    assert client.chat("q") == ""
+    assert client.chat("q") is None
     assert client.chat_validated_text("q") is None
+
+
+def test_429_then_200_retries_once(monkeypatch):
+    rec = install(monkeypatch, [
+        FakeResp(429, {"error": "rate limited"}),
+        FakeResp(200, {"choices": [{"message": {"content": "after cool down"}}]}),
+    ])
+    monkeypatch.setenv("GROQ_API_KEY", "sk-test-9876zyxw")
+    out = LLMClient(provider=PROVIDERS["groq"]).chat("hi")
+    assert out == "after cool down"
+    assert len(rec.calls) == 2
+
+
+def test_dict_choices_do_not_raise(monkeypatch):
+    install(monkeypatch, [FakeResp(200, {"choices": {"message": {"content": "x"}}})])
+    monkeypatch.setenv("GROQ_API_KEY", "sk-test-9876zyxw")
+    assert LLMClient(provider=PROVIDERS["groq"]).chat("hi") is None
 
 
 # --------------------------------------------------------------------------- #
@@ -296,7 +319,158 @@ def test_timeout_kwarg_forwarded_to_seam(monkeypatch):
     assert rec.calls[0]["timeout"] == 42
 
 
+def test_google_provider_uses_openai_compat_endpoint():
+    p = PROVIDERS["google"]
+    assert p.style == "openai"
+    assert p.api_key_env == "GEMINI_API_KEY"
+    assert "generativelanguage.googleapis.com" in p.base_url
+    assert p.model
+
+
+def test_provider_api_key_env_beats_file(monkeypatch, tmp_path):
+    keyfile = tmp_path / "gemini_key"
+    keyfile.write_text("file-key-000")
+    monkeypatch.setattr(llm_client, "_GEMINI_KEY_FILE", str(keyfile))
+    monkeypatch.setenv("GEMINI_API_KEY", "env-key-000")
+    assert provider_api_key(PROVIDERS["google"]) == "env-key-000"
+
+
+def test_provider_api_key_gemini_reads_file(monkeypatch, tmp_path):
+    keyfile = tmp_path / "gemini_key"
+    keyfile.write_text("  'file-key-000'  ")
+    monkeypatch.setattr(llm_client, "_GEMINI_KEY_FILE", str(keyfile))
+    assert provider_api_key(PROVIDERS["google"]) == "file-key-000"
+    assert gemini_configured()
+
+
+def test_provider_api_key_non_gemini_never_reads_file():
+    assert provider_api_key(PROVIDERS["groq"]) == ""
+
+
+def test_configure_gemini_key_persists_0600(monkeypatch, tmp_path):
+    keyfile = tmp_path / "gemini_key"
+    monkeypatch.setattr(llm_client, "_GEMINI_KEY_FILE", str(keyfile))
+    assert configure_gemini_key("'AQ.some-gemini-key-12345'") is True
+    assert keyfile.read_text() == "AQ.some-gemini-key-12345"
+    assert (keyfile.stat().st_mode & 0o777) == 0o600
+    assert gemini_configured()
+
+
+def test_configure_gemini_key_rejects_short(monkeypatch, tmp_path):
+    keyfile = tmp_path / "gemini_key"
+    monkeypatch.setattr(llm_client, "_GEMINI_KEY_FILE", str(keyfile))
+    assert configure_gemini_key(("x" * 5)) is False
+    assert not keyfile.exists()
+
+
+def test_planner_reply_uses_file_key_when_env_unset(monkeypatch, tmp_path):
+    keyfile = tmp_path / "gemini_key"
+    keyfile.write_text("AQ.file-key-12345")
+    monkeypatch.setattr(llm_client, "_GEMINI_KEY_FILE", str(keyfile))
+    rec = install(monkeypatch, [
+        FakeResp(200, {"choices": [{"message": {"content": "1) weigh options 2) decide"}}]}),
+    ])
+    assert llm_client.planner_reply(
+        "What is the best approach to plan a launch roadmap?") == \
+        "1) weigh options 2) decide"
+    assert len(rec.calls) == 1
+    assert rec.calls[0]["headers"]["Authorization"] == "Bearer AQ.file-key-12345"
+
+
+def test_chat_anywhere_falls_back_from_groq_to_google(monkeypatch):
+    """Groq 429s/empties -> the Gemini fallback answers."""
+    monkeypatch.setenv("GROQ_API_KEY", "sk-groq-test")
+    monkeypatch.setenv("GEMINI_API_KEY", "sk-gemini-test")
+    rec = install(monkeypatch, [
+        FakeResp(429, {"error": "rate limited"}),       # groq attempt 1
+        FakeResp(429, {"error": "rate limited"}),       # groq retry
+        FakeResp(200, {"choices": [{"message": {"content": "gemini saved us"}}]}),
+    ])
+    out = llm_client.chat_anywhere("best travel plan?")
+    assert out == "gemini saved us"
+    assert len(rec.calls) == 3
+    assert rec.calls[-1]["url"] == PROVIDERS["google"].base_url
+    assert rec.calls[-1]["headers"]["Authorization"] == "Bearer sk-gemini-test"
+
+
+def test_chat_anywhere_primary_success_never_touches_google(monkeypatch):
+    monkeypatch.setenv("GROQ_API_KEY", "sk-groq-test")
+    monkeypatch.setenv("GEMINI_API_KEY", "sk-gemini-test")
+    rec = install(monkeypatch, [
+        FakeResp(200, {"choices": [{"message": {"content": "groq answered"}}]}),
+    ])
+    out = llm_client.chat_anywhere("hello")
+    assert out == "groq answered"
+    assert len(rec.calls) == 1
+    assert rec.calls[0]["url"] == PROVIDERS["groq"].base_url
+
+
+def test_chat_anywhere_skips_missing_keys_without_calls(monkeypatch):
+    rec = install(monkeypatch)
+    assert llm_client.chat_anywhere("hi") is None
+    assert rec.calls == []
+
+
+def test_chat_anywhere_rejects_blank_prompt():
+    assert llm_client.chat_anywhere("   ") is None
+    assert llm_client.chat_anywhere("") is None
+
+
+def test_planner_reply_requires_key(monkeypatch):
+    rec = install(monkeypatch)
+    assert llm_client.planner_reply(
+        "Compare the pros and cons of owning vs renting a home?") is None
+    assert rec.calls == []
+
+
+def test_planner_reply_ignores_quick_questions(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "sk-gemini-test")
+    rec = install(monkeypatch)
+    assert llm_client.planner_reply("turn on the lights") is None
+    assert rec.calls == []
+
+
+def test_planner_reply_hard_problem_uses_gemini(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "sk-gemini-test")
+    rec = install(monkeypatch, [
+        FakeResp(200, {"choices": [{"message": {"content": "1) analyze cost 2) try"}}]}),
+    ])
+    out = llm_client.planner_reply(
+        "What is the best approach to plan a software migration?")
+    assert out == "1) analyze cost 2) try"
+    assert len(rec.calls) == 1
+    assert rec.calls[0]["url"] == PROVIDERS["google"].base_url
+    assert PROVIDERS["google"].model in rec.calls[0]["json"]["model"]
+
+
+def test_planner_reply_routes_output_through_harness_cleaner(monkeypatch):
+    """Gemini chatter must be normalized like Groq replies."""
+    monkeypatch.setenv("GEMINI_API_KEY", "sk-gemini-test")
+    install(monkeypatch, [
+        FakeResp(200, {"choices": [{"message": {
+            "content": "Certainly, sir! Here is the plan:\n\nstep one.\n"
+                       "I hope this helps."}}]}),
+    ])
+    out = llm_client.planner_reply(
+        "What is the best approach to plan a budget?")
+    assert "Certainly" not in out
+    assert "I hope this helps" not in out
+    assert "step one." in out
+
+
+def test_planner_reply_returns_none_on_network_failure(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "sk-gemini-test")
+    rec = install(monkeypatch, [
+        requests.exceptions.Timeout("slow"), requests.exceptions.Timeout("slow"),
+    ])
+    assert llm_client.planner_reply("Plan a step by step home renovation?") is None
+    assert len(rec.calls) == 2
+
+
 def test_module_exports_expected_surface():
     for attr in ("Provider", "PROVIDERS", "active_provider",
-                 "LLMClient", "mask_key", "_post"):
+                 "LLMClient", "mask_key", "_post",
+                 "chat_anywhere", "planner_reply",
+                 "provider_api_key", "configure_gemini_key",
+                 "gemini_configured"):
         assert hasattr(llm_client, attr)

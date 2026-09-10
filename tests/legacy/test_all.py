@@ -558,6 +558,182 @@ safe_src = src.split("def _ask_ai_safely", 1)[1].split("\n    def ", 1)[0]
 check("no input() call inside _ask_ai_safely", "input(" not in safe_src,
       "input() still present")
 
+print("\n== BROWSER CONTROL (multi_browser mocked; no real browser touched) ==")
+import multi_browser as _mb
+_calls = {"open_url": [], "activate": [], "page_text": [],
+          "click_by_text": [], "type_keys": [], "scroll": [],
+          "go_back": [], "go_forward": [], "refresh": [],
+          "front_url": [], "pick": []}
+_FN = ("pick", "open_url", "activate", "page_text", "click_by_text",
+       "type_keys", "scroll", "go_back", "go_forward", "refresh", "front_url")
+_mb_orig = {n: getattr(_mb, n) for n in _FN}
+
+
+def _mb_vec(n):
+    return list(_calls[n])
+
+
+def _clr():
+    for v in _calls.values():
+        v.clear()
+
+
+def _mm_pick(name=None):
+    _calls["pick"].append(name)
+    return "Google Chrome"
+
+
+def _mm_open_url(b, u):
+    _calls["open_url"].append((b, u))
+    return True, "ok"
+
+
+def _mm_activate(b):
+    _calls["activate"].append(b)
+    return True, ""
+
+
+def _mm_page_text(b, n):
+    _calls["page_text"].append((b, n))
+    return True, "The quick brown fox jumps over the lazy dog."
+
+
+def _mm_click_by_text(b, l):
+    _calls["click_by_text"].append((b, l))
+    return True, "clicked:" + l
+
+
+def _mm_type_keys(b, t):
+    _calls["type_keys"].append((b, t))
+    return True, ""
+
+
+def _mm_scroll(b, d):
+    _calls["scroll"].append((b, d))
+    return True, ""
+
+
+def _mm_go_back(b):
+    _calls["go_back"].append(b)
+    return True, ""
+
+
+def _mm_go_forward(b):
+    _calls["go_forward"].append(b)
+    return True, ""
+
+
+def _mm_refresh(b):
+    _calls["refresh"].append(b)
+    return True, ""
+
+
+def _mm_front_url(b):
+    _calls["front_url"].append(b)
+    return True, "https://example.com"
+
+
+for _n, _f in (("pick", _mm_pick), ("open_url", _mm_open_url),
+               ("activate", _mm_activate), ("page_text", _mm_page_text),
+               ("click_by_text", _mm_click_by_text),
+               ("type_keys", _mm_type_keys), ("scroll", _mm_scroll),
+               ("go_back", _mm_go_back), ("go_forward", _mm_go_forward),
+               ("refresh", _mm_refresh), ("front_url", _mm_front_url)):
+    setattr(_mb, _n, _f)
+
+
+def br(cmd):
+    opened.clear()
+    said.clear()
+    _clr()
+    app.process(cmd)
+    return list(opened), list(said)
+
+
+o, s = br("open youtube in chrome")
+check("open <site> in chrome uses multi_browser, not webbrowser",
+      _mb_vec("open_url") == [("Google Chrome", "https://www.youtube.com")]
+      and not o, (_mb_vec("open_url"), o))
+o, s = br("open example.com using safari")
+check("open <domain> in safari gains https",
+      _mb_vec("open_url") == [("Safari", "https://example.com")],
+      _mb_vec("open_url"))
+o, s = br("switch to arc")
+check("switch to arc activates Arc",
+      _mb_vec("activate") == ["Arc"], _mb_vec("activate"))
+o, s = br("read this page")
+check("read this page reads page text",
+      _mb_vec("page_text") == [("Google Chrome", 1500)] and
+      any("Here is the page" in x for x in s), (_mb_vec("page_text"), s))
+o, s = br("click read more on the page")
+check("click <label> on the page clicks by text",
+      _mb_vec("click_by_text") == [("Google Chrome", "read more")] and
+      any("Clicked 'read more'" in x for x in s),
+      (_mb_vec("click_by_text"), s))
+o, s = br("type hello world into the page")
+check("type <text> into the page types",
+      _mb_vec("type_keys") == [("Google Chrome", "hello world")],
+      _mb_vec("type_keys"))
+o, s = br("scroll down on the page")
+check("scroll down scrolls the page",
+      bool(_mb_vec("scroll")) and _mb_vec("scroll")[0][0] == "Google Chrome"
+      and abs(_mb_vec("scroll")[0][1]) > 0, _mb_vec("scroll"))
+o, s = br("refresh the page")
+check("refresh reloads the page",
+      _mb_vec("refresh") == ["Google Chrome"], _mb_vec("refresh"))
+o, s = br("go back in the browser")
+check("go back goes back", _mb_vec("go_back") == ["Google Chrome"],
+      _mb_vec("go_back"))
+o, s = br("what's the current page url")
+check("current page url read back",
+      _mb_vec("front_url") == ["Google Chrome"] and
+      any("https://example.com" in x for x in s),
+      (_mb_vec("front_url"), s))
+
+o, s = br("open youtube")
+check("open youtube still uses the normal open path",
+      bool(o) and any("youtube.com" in u for u in o) and
+      not _mb_vec("open_url"), (o, _mb_vec("open_url")))
+check("browser control ignores plain chat 'summarize history of rome'",
+      app._browser_control("summarize the history of rome") is False, "")
+check("browser control ignores weather chat",
+      app._browser_control("what's the weather") is False, "")
+check("browser control ignores open app",
+      app._browser_control("open the calculator") is False, "")
+
+print("\n== JARVISBOT open parity + browser control ==")
+bot2 = object.__new__(main.JarvisBot)
+bot2.say = lambda s2: said.append(s2)
+opened.clear()
+said.clear()
+bot2._handle_open("go to youtube")
+check("bot open: 'go to youtube' opens known website",
+      any("youtube.com" in u for u in opened), opened)
+opened.clear()
+said.clear()
+bot2._handle_open("open https://example.com")
+check("bot open: raw https url kept intact",
+      opened == ["https://example.com"], opened)
+opened.clear()
+said.clear()
+r = bot2._browser_control("read the page")
+check("bot browser: read the page routes",
+      r is True and any("Here is the page" in x for x in said), (r, said))
+
+for _n in _FN:
+    setattr(_mb, _n, _mb_orig[_n])
+
+print("\n== CLICK/DRAG (detection only; no real clicks in tests) ==")
+_hit = b.think("drag from 100 200 to 300 400")
+check("cp_drag fires on 'drag from 100 200 to 300 400'",
+      bool(_hit) and _hit[0].name == "cp_drag", str(_hit))
+_hit2 = b.think("drag and drop the file to the trash please")
+check("cp_drag does not claim chat 'drag and drop'",
+      not _hit2 or _hit2[0].name != "cp_drag", str(_hit2))
+_hit3 = b.think("drag 50 100")
+check("cp_drag fires on relative 'drag 50 100'",
+      bool(_hit3) and _hit3[0].name == "cp_drag", str(_hit3))
+
 print("\n== CLEANUP ==")
 os.chdir(_OLD_CWD)
 shutil.rmtree(_SANDBOX, ignore_errors=True)

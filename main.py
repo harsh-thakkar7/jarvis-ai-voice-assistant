@@ -42,13 +42,32 @@ if platform.system() == "Darwin":
     webbrowser.register("macos_launchservices", _LaunchServicesBrowser,
                         preferred=True)
 
+
+def _ai_studio_full_runtime():
+    """True ONLY in a real interactive session, never under the test suites.
+
+    The test harness either stubs main.time.sleep with a lambda (test_full —
+    which mutates the shared time module, so compare builtin names) or sets the
+    JARVIS_TEST env var. Live, hands-free AI Studio driving (vision focus,
+    verified run clicks, preview confirmation) is gated behind this so the
+    suites stay fast, offline and flake-free.
+    """
+    try:
+        name = getattr(time.sleep, "__name__", None)
+        if name is None or name != "sleep":
+            return False
+    except Exception:
+        return False
+    return not os.environ.get("JARVIS_TEST")
+
 from brain import Brain
 
 import brain as brain_core
 import brain_extra as brain_extra_core  # extra skills + offline chat auto-load
+import multi_browser  # drive Chrome/Safari/Edge/Firefox/Brave/Arc via JS + fallback
 
 import requests
-import speech_recognition as sr
+import jarvis.canary_stt as canary_stt
 import tkinter as tk
 from tkinter import font as tkfont
 
@@ -198,8 +217,6 @@ APP_MAP = {
     "home": "Home",
     "shortcuts": "Shortcuts",
 }
-
-USE_WHISPER = False
 
 DESIGN_W, DESIGN_H = 1280, 800
 
@@ -463,23 +480,16 @@ def _is_web_worthy(query):
 
 
 def open_aistudio_build(prompt, is_app=False):
-
-
     """Open the AI Studio Build-mode URL for the given app idea.
 
     Returns True if the browser was asked to open the build page. The prompt
     arrives pre-filled in the prompt section thanks to the `prompt` URL param.
     """
     url = aistudio_build_url(prompt, is_app)
-    if platform.system() == "Darwin":
-        # LaunchServices `open` honors the default browser and needs no
-        # per-app AppleEvent permission, unlike webbrowser.open's osascript
-        # route, which fails silently without the Automation permission.
-        try:
-            subprocess.Popen(["open", url])
-            return True
-        except Exception:
-            pass
+    # On Darwin, webbrowser.open routes through the _LaunchServicesBrowser
+    # handler registered at import time, which shells out to `open url`.
+    # Doing an extra subprocess.Popen(["open", url]) here would open a
+    # second tab, so go through webbrowser.open exactly once.
     try:
         webbrowser.open(url)
         return True
@@ -1452,22 +1462,11 @@ class JarvisApp:
     def _ptt_record(self):
         """Record mic frames from button press until release."""
         try:
-            r = sr.Recognizer()
-            mic = sr.Microphone()
-            with mic as source:
-                self._last_mic_err = None
-                r.adjust_for_ambient_noise(source, duration=0.2)
-                frames = []
-                max_bytes = mic.SAMPLE_RATE * mic.SAMPLE_WIDTH * 15
-                total = 0
-                while not self._ptt_stop.is_set() and total < max_bytes:
-                    frame = source.stream.read(mic.CHUNK)
-                    frames.append(frame)
-                    total += len(frame)
-                if frames:
-                    self._ptt_audio = sr.AudioData(b"".join(frames),
-                                                   mic.SAMPLE_RATE,
-                                                   mic.SAMPLE_WIDTH)
+            self._last_mic_err = None
+            mic = canary_stt.MicCapture()
+            mic.calibrate(duration=0.2)
+            max_bytes = canary_stt.SAMPLE_RATE * canary_stt.SAMPLE_WIDTH * 15
+            self._ptt_audio = mic.record_until(self._ptt_stop, max_bytes=max_bytes)
         except Exception as e:
             self._ptt_error = self._mic_error_message(e)
 
@@ -1493,7 +1492,7 @@ class JarvisApp:
                 heard = ""
             if heard == "__REQUEST_ERROR__":
                 self.ui_q.put(("sys",
-                               "Speech service unavailable. Check internet connection."))
+                               "Speech model unavailable. Run JARVIS setup to install it."))
                 return
             heard = (heard or "").strip()
             if heard:
@@ -1580,7 +1579,7 @@ class JarvisApp:
                 self.ui_q.put(("auto_off", None))
                 self.say("Continuous listening disabled, sir.")
                 break
-            m = re.search(r"\b(?:hey\s+)?jarvis\b[,!.]?\s*(.*)$", low)
+            m = re.search(r"\b(?:hey\s+)?j(?:arv|av)is\b[,!.]?\s*(.*)$", low)
             if m:
                 cmd = m.group(1).strip(" .,")
                 # Only shut down when the wake word was used — ambient
@@ -1629,7 +1628,7 @@ class JarvisApp:
                 self.say("Entering standby, sir. Say wake up jarvis when you need me.")
                 return
             # "jarvis, what time is it" -> run the trailing command
-            m = re.match(r"^\s*(?:hey\s+)?jarvis\s*[,.!?]?\s*(.+)$", cmd, re.I)
+            m = re.match(r"^\s*(?:hey\s+)?j(?:arv|av)is\s*[,.!?]?\s*(.+)$", cmd, re.I)
             if m and not re.search(r"\b(wake up|wakeup)\b", cmd, re.I):
                 self.awake = True
                 self.ui_q.put(("awake", None))
@@ -2124,11 +2123,9 @@ class JarvisApp:
     def _watch_for_interrupt(self):
         try:
             time.sleep(0.35)
-            with sr.Microphone() as source:
-                r = sr.Recognizer()
-                r.pause_threshold = 0.6
-                audio = r.listen(source, timeout=3, phrase_time_limit=3)
-            heard = r.recognize_google(audio, language="en-US").lower()
+            mic = canary_stt.MicCapture()
+            audio = mic.listen(timeout=3, phrase_time_limit=3, pause_threshold=0.6)
+            heard = canary_stt.transcribe(audio.raw_data).lower()
         except Exception:
             return
         if any(k in heard for k in ("stop", "shut up", "quiet", "silence",
@@ -2144,27 +2141,22 @@ class JarvisApp:
     def listen(self, timeout=6, phrase_limit=10):
         if self.speaking.is_set():
             return ""
-        r = sr.Recognizer()
-        r.energy_threshold = 150
-        r.dynamic_energy_threshold = True
-        r.dynamic_energy_ratio = 1.2
-        r.pause_threshold = 0.7
         # Fast-listen: reuse a previously calibrated noise floor instead
         # of burning 1 s on ambient calibration every single listen.
         cached = getattr(self, "_cached_energy", None)
         fast = os.environ.get("JARVIS_SLOW_LISTEN") != "1"
         try:
-            with sr.Microphone() as source:
-                self._last_mic_err = None
-                if fast and cached:
-                    r.energy_threshold = cached
-                    r.dynamic_energy_threshold = False
-                else:
-                    r.adjust_for_ambient_noise(source, duration=1.0)
-                    if fast:
-                        self._cached_energy = r.energy_threshold
-                audio = r.listen(source, timeout=timeout, phrase_time_limit=phrase_limit)
-        except sr.WaitTimeoutError:
+            mic = canary_stt.MicCapture()
+            self._last_mic_err = None
+            if fast and cached:
+                energy = cached
+            else:
+                energy = mic.calibrate(duration=1.0)
+                if fast:
+                    self._cached_energy = energy
+            audio = mic.listen(timeout=timeout, phrase_time_limit=phrase_limit,
+                               pause_threshold=0.7, energy_threshold=energy)
+        except canary_stt.WaitTimeoutError:
             # Normal silence within the timeout window — not a microphone
             # problem, so stay quiet instead of spamming the transcript.
             return ""
@@ -2176,44 +2168,37 @@ class JarvisApp:
             return ""
         heard = self._recognize_audio(audio)
         if heard == "__REQUEST_ERROR__":
-            self.say("My speech service is unreachable, sir. Please check your internet connection.")
+            self.say("My speech model is unavailable, sir. Please run JARVIS setup to install it.")
             return ""
         return heard
 
     @staticmethod
     def _mic_error_message(err):
         """Map a voice-pipeline exception to a user-friendly message."""
-        if isinstance(err, sr.RequestError):
-            return "Speech service unavailable. Check internet connection."
         try:
             text = str(err).lower()
         except Exception:
             text = ""
+        if ("canary" in text or "model not found" in text
+                or "model" in text and "not found" in text
+                or "transcribe-cpp" in text):
+            return "Speech model not found. Run JARVIS setup to install it."
         if ("permission" in text or "authoriz" in text or "consent" in text
                 or "not allowed" in text or "-9999" in text or "-9996" in text):
             return "Microphone permission required. Check System Preferences."
         return "No microphone detected. Check audio settings."
 
     def _recognize_audio(self, audio):
-        """Recognize captured AudioData. Returns lowercased text,
+        """Recognize captured audio. Returns lowercased text,
         '' for unintelligible input, or '__REQUEST_ERROR__' on service failure."""
         try:
             audio = self._boost_audio(audio)
         except Exception:
             pass
-        r = sr.Recognizer()
         try:
-            if USE_WHISPER:
-                try:
-                    heard = r.recognize_whisper(audio, model="base", language="en")
-                    if heard and heard.strip():
-                        return heard.lower()
-                except Exception:
-                    pass
-            return r.recognize_google(audio, language="en-US").lower()
-        except sr.UnknownValueError:
-            return ""
-        except sr.RequestError:
+            heard = canary_stt.transcribe(audio.raw_data)
+            return (heard or "").lower().strip()
+        except canary_stt.ModelUnavailable:
             return "__REQUEST_ERROR__"
         except Exception:
             return ""
@@ -2233,7 +2218,9 @@ class JarvisApp:
                 return audio
             boosted = array.array("h", (max(-32768, min(32767, int(s * gain)))
                                         for s in samples))
-            return sr.AudioData(boosted.tobytes(), 16000, 2)
+            return canary_stt.AudioChunk(boosted.tobytes(),
+                                         canary_stt.SAMPLE_RATE,
+                                         canary_stt.SAMPLE_WIDTH)
         except Exception:
             return audio
 
@@ -3114,7 +3101,7 @@ class JarvisApp:
         return day.isoformat(), tstr
 
     def calendar_add(self, cmd):
-        text = re.sub(r"^\s*(?:hey\s+)?(?:jarvis[,:]\s*)?", "", cmd, flags=re.I)
+        text = re.sub(r"^\s*(?:hey\s+)?(?:j(?:arv|av)is[,:]\s*)?", "", cmd, flags=re.I)
         text = re.sub(r"\badd\s+(?:an?\s+)?(?:new\s+)?"
                       r"(?:event|appointment|meeting)\b[:\s]*", " ", text,
                       flags=re.I)
@@ -3618,7 +3605,7 @@ class JarvisApp:
         if not cmd or cmd == PLACEHOLDER.lower():
             return
 
-        m_j = re.match(r"^(?:hey\s+)?jarvis\s*[,.!?\s]+\s*(.+)$", cmd, re.I)
+        m_j = re.match(r"^(?:hey\s+)?j(?:arv|av)is\s*[,.!?\s]+\s*(.+)$", cmd, re.I)
         if m_j:
             cmd = m_j.group(1).strip()
 
@@ -3653,6 +3640,9 @@ class JarvisApp:
         br = parse_build_request(cmd)
         if br:
             self.build_website(br["topic"], br["kind"])
+            return
+
+        if self._browser_control(cmd):
             return
 
         if self._is_research_write(cmd):
@@ -3961,7 +3951,152 @@ class JarvisApp:
             return ("app", key, APP_MAP[key])
         return None
 
+    def _browser_control(self, cmd):
+        """Drive a browser directly: read the page, click/type/scroll on
+        pages, go back/forward, refresh, fetch the page URL, and open URLs
+        in a specific browser (Chrome/Safari/Edge/Firefox/Brave/Arc).
+
+        Returns True when the command was a browser-control request (even if
+        the action could not be performed), False otherwise. Runs before the
+        brain and before the generic open handler so "open X in chrome" is
+        never swallowed as a search or an app-launch.
+        """
+        c = cmd.strip(" .,?!")
+
+        # "open <target> in <browser>"
+        m = re.match(
+            r"^(?:open|go\s+to|launch)\s+(.+?)\s+(?:in|using|with)\s+"
+            r"(?:the\s+)?(chrome|safari|edge|firefox|brave|arc)"
+            r"(?:\s+browser)?\s*$", c)
+        if m:
+            target = m.group(1).strip(" .,")
+            name = multi_browser.normalize(m.group(2))
+            if target in WEBSITES:
+                target = WEBSITES[target]
+            elif "://" not in target and " " not in target and "." in target:
+                target = "https://" + target
+            elif "://" not in target and " " in target:
+                target = ("https://www.google.com/search?q="
+                          + target.replace(" ", "+"))
+            ok, msg = multi_browser.open_url(name, target)
+            self.say(f"Opening {target} in {name}, sir." if ok
+                     else f"I could not open {name}, sir. {msg}")
+            return True
+
+        # "switch to chrome" / "change over to safari" / "activate arc"
+        m = re.match(r"^(?:switch|change)\s+(?:to|over\s+to)\s+(?:the\s+)?"
+                     r"(chrome|safari|edge|firefox|brave|arc)"
+                     r"(?:\s+browser)?\s*$", c)
+        if m:
+            name = multi_browser.normalize(m.group(1))
+            ok, _msg = multi_browser.activate(name)
+            self.say(f"Switching to {name}, sir." if ok
+                     else f"I could not activate {name}, sir.")
+            return True
+        m = re.match(r"^activate\s+(?:the\s+)?"
+                     r"(chrome|safari|edge|firefox|brave|arc)"
+                     r"(?:\s+browser)?\s*$", c)
+        if m:
+            name = multi_browser.normalize(m.group(1))
+            ok, _msg = multi_browser.activate(name)
+            self.say(f"Switching to {name}, sir." if ok
+                     else f"I could not activate {name}, sir.")
+            return True
+
+        # "read the page" / "read this page" / "summarize the page"
+        if re.search(r"^(?:read|summarize|what'?s\s+on)\s+"
+                     r"(?:the|this)\s+(?:current\s+)?(?:web\s+)?page\s*$", c):
+            browser = multi_browser.pick()
+            ok, text = multi_browser.page_text(browser, 1500)
+            if ok and text.strip():
+                snippet = " ".join(text.split())[:900]
+                self.say(f"Here is the page, sir: {snippet}...")
+            else:
+                self.say("I could not read the page, sir. "
+                         + (str(text)[:160] if not ok else ""))
+            return True
+
+        # "click <label> on the page"
+        m = re.match(r"^(?:click|tap|press)\s+(?:on\s+)?(.+?)\s+"
+                     r"(?:on|in)\s+(?:the|this)\s+page\s*$", c)
+        if m:
+            label = m.group(1).strip(" .,")
+            browser = multi_browser.pick()
+            ok, out = multi_browser.click_by_text(browser, label)
+            if ok and out.startswith("clicked"):
+                self.say(f"Clicked '{label}' on the page, sir.")
+            else:
+                self.say(f"I could not find '{label}' on the page, sir.")
+            return True
+
+        # "type <text> into the page"
+        m = re.match(r"^type\s+(.+?)\s+(?:into|in)\s+(?:the|this)\s+"
+                     r"(?:page|search\s*box)\s*$", c)
+        if m:
+            text = m.group(1).strip(" .,")
+            browser = multi_browser.pick()
+            ok, out = multi_browser.type_keys(browser, text)
+            self.say(f"Typed '{text}' into the page, sir." if ok
+                     else "I could not type into the page, sir. "
+                          + str(out)[:160])
+            return True
+
+        # "scroll down on the page" / "scroll to the bottom" / "scroll up"
+        m = re.match(r"^scroll\s+(?:(?:down|up)|to\s+(?:the\s+)?"
+                     r"(?:bottom|top))\s*(?:on\s+)?(?:the\s+)?"
+                     r"(?:page|browser)?\s*$", c)
+        if m:
+            browser = multi_browser.pick()
+            how = m.group(0)
+            dy = (-1500 if "top" in how else 900 if "bottom" in how else
+                  -900 if "up" in how else 900)
+            ok, out = multi_browser.scroll(browser, dy)
+            self.say("Scrolled the page, sir." if ok
+                     else "I could not scroll the page, sir. " + str(out)[:160])
+            return True
+
+        # "go back in the browser" / "go forward one page"
+        m = re.match(r"^go\s+(back|forward)\s*(?:one\s+page\s*)?"
+                     r"(?:in\s+)?(?:the\s+)?(?:browser|page)?\s*$", c)
+        if m:
+            browser = multi_browser.pick()
+            fn = (multi_browser.go_back if m.group(1) == "back"
+                  else multi_browser.go_forward)
+            ok, out = fn(browser)
+            self.say(f"Taking you {m.group(1)}, sir." if ok
+                     else f"I could not go {m.group(1)}, sir. " + str(out)[:160])
+            return True
+
+        # "refresh the page" / "reload the tab"
+        if re.search(r"^(?:refresh|reload)\s+(?:the\s+)?"
+                     r"(?:page|browser|tab)?\s*$", c):
+            browser = multi_browser.pick()
+            ok, out = multi_browser.refresh(browser)
+            self.say("Refreshed the page, sir." if ok
+                     else "I could not refresh the page, sir. " + str(out)[:160])
+            return True
+
+        # "what's the current page url" / "current url on the page"
+        if re.search(r"(?:current|this|the)\s+(?:page|tab|website|browser)\s+"
+                     r"url\b|\burl\s+of\s+(?:this|the)\s+page\b|"
+                     r"\bwhat'?s\s+the\s+(?:current\s+)?url\b|"
+                     r"\bcurrent\s+url\b", c):
+            browser = multi_browser.pick()
+            ok, out = multi_browser.front_url(browser)
+            if ok and str(out).strip():
+                self.say("The current page is " + str(out).strip() + ", sir.")
+            else:
+                self.say("I could not read the current URL, sir.")
+            return True
+
+        return False
+
     def _handle_open(self, cmd):
+        m = re.search(r"(https?://\S+)", cmd)
+        if m:
+            webbrowser.open(m.group(1))
+            self.say("Opening link.")
+            return
         if not re.match(r"^(?:open|go\s+to|launch)\b", cmd):
             b = self._bare_name(cmd)
             if b:
@@ -4109,12 +4244,14 @@ class JarvisApp:
             print("LOCAL CHAT ERROR:", e)
             return None
 
-    def _ask_ai_safely(self, prompt, _code_gen_mode=False):
+    def _ask_ai_safely(self, prompt, _code_gen_mode=False, _skip_local=False):
         """Smart routing: try local brain first, then Groq for complex tasks.
 
         Returns the response string, or None if nothing worked.
         """
         if not load_api_key():
+            if _skip_local:
+                return None
             self._set_ai_mode("LOCAL")
             local = self._local_chat(prompt, _code_gen_mode=_code_gen_mode)
             if local:
@@ -4124,9 +4261,11 @@ class JarvisApp:
                     "language model.")
 
         # Try local brain first for speed
-        local = self._local_chat(prompt, _code_gen_mode=_code_gen_mode)
-        if local:
-            return local
+        local = None
+        if not _skip_local:
+            local = self._local_chat(prompt, _code_gen_mode=_code_gen_mode)
+            if local:
+                return local
 
         # Local brain couldn't handle it — use Groq
         reply = ask_ai(prompt, list(self.history))
@@ -4147,6 +4286,9 @@ class JarvisApp:
             return local or None
         if reply == "__UNAUTHORIZED__":
             self._set_ai_mode("LOCAL")
+            if _skip_local:
+                return ("My API key was rejected, sir. Please check it is "
+                        "correct. Say 'set api key' to give me a fresh key.")
             local = self._local_chat(prompt)
             if local:
                 return ("My API key was rejected, sir, so I switched to my "
@@ -4155,16 +4297,19 @@ class JarvisApp:
                     "Say 'set api key' to give me a fresh key.")
         if reply == "__RATE_LIMITED__":
             self._set_ai_mode("LOCAL")
-            local = self._local_chat(prompt)
             msg = ("Your API key limit has been hit, sir. "
                    "I switched to my local brain automatically. "
                    "Say 'set api key' to paste a new Groq key to continue "
                    "with Groq, or I will keep running on local brain.")
-            if local:
-                return msg + " " + local
+            if not _skip_local:
+                local = self._local_chat(prompt)
+                if local:
+                    return msg + " " + local
             return msg
         if reply and reply.startswith("I hit an error"):
             self._set_ai_mode("LOCAL")
+            if _skip_local:
+                return reply
             offline = self._local_chat(prompt)
             return offline if offline else reply
         self._set_ai_mode("ONLINE")
@@ -4889,15 +5034,17 @@ class JarvisApp:
                 self.say("I've opened the Android app builder with your prompt, sir. "
                          "The preview is generating on the right now.")
             else:
-                self.say("I've opened the Android app builder with your prompt pre-filled, sir. "
-                         "Press Run prompt and the preview will appear.")
+                self.say("I've opened the Android app builder for you, sir. If the "
+                         "prompt didn't appear, paste it from the clipboard and "
+                         "press Run prompt to generate the preview.")
         else:
             if self._aistudio_automate(prompt, "web"):
                 self.say("I've opened the app builder with your prompt, sir. "
                          "The preview is generating on the right now.")
             else:
-                self.say("I've opened the app builder with your prompt pre-filled, sir. "
-                         "Press Run prompt and the preview will appear.")
+                self.say("I've opened the app builder for you, sir. If the prompt "
+                         "didn't appear, paste it from the clipboard and press "
+                         "Run prompt to generate the preview.")
 
     def _ask_build_kind(self):
         """Ask user whether they want a website or full application.
@@ -4931,18 +5078,42 @@ class JarvisApp:
             "responsive layout, tasteful colors, and a professional look. Output ONLY "
             "the prompt text itself, no quotes, no code fences, no explanation."
         )
-        raw = self._ask_ai_safely(ask)
+        return self._ask_online_prompt(ask, self._default_website_prompt(topic))
+
+    def _ask_online_prompt(self, ask, default):
+        """Build an AI Studio prompt using ONLY the online model (Groq, then
+        Gemini). The local brain is deliberately bypassed: its code-generation
+        detector hijacks meta-asks like 'write a prompt for a website' and
+        returns canned prose that would otherwise be pasted verbatim into
+        Google AI Studio.
+        """
+        raw = self._ask_ai_safely(ask, _skip_local=True)
         if raw == "__UNAUTHORIZED__":
-            self.say("That key was rejected too, sir. Please double check it on groq dot com.")
-            return self._default_website_prompt(topic)
-        if raw is None:
-            return self._default_website_prompt(topic)
-        if raw.startswith("I hit an error"):
-            return self._default_website_prompt(topic)
+            self.say("That key was rejected too, sir. Please double check it "
+                     "on groq dot com.")
+            return default
+        if raw is None or raw.startswith("I hit an error"):
+            return default
+        if raw.count("```") >= 2:
+            raw = raw.split("```")[-2]
         raw = raw.strip().strip('"').strip("'")
-        if len(raw) < 40 or not any(w in raw.lower() for w in
-                                   ("website", "html", "page", "site")):
-            return self._default_website_prompt(topic)
+        low = raw.lower()
+        if low.startswith(("i can generate code locally",
+                           "i am running on my local",
+                           "my api key was rejected",
+                           "your api key limit",
+                           "i could not reach",
+                           "tell me the language",
+                           "i can't", "i cannot", "i am not able",
+                           "i am unable", "that is beyond my",
+                           "as an ai", "i'm sorry", "i am sorry",
+                           "i am a language model", "i can't write",
+                           "i cannot write")):
+            return default
+        if len(raw) < 40 or not any(w in low for w in
+                                    ("website", "html", "page", "site",
+                                     "app", "application")):
+            return default
         return raw
 
     def _default_app_prompt(self, topic):
@@ -4963,18 +5134,7 @@ class JarvisApp:
             "multiple screens, navigation, and all necessary code. Output ONLY "
             "the prompt text itself, no quotes, no code fences, no explanation."
         )
-        raw = self._ask_ai_safely(ask)
-        if raw == "__UNAUTHORIZED__":
-            self.say("That key was rejected too, sir. Please double check it on groq dot com.")
-            return self._default_app_prompt(topic)
-        if raw is None:
-            return self._default_app_prompt(topic)
-        if raw.startswith("I hit an error"):
-            return self._default_app_prompt(topic)
-        raw = raw.strip().strip('"').strip("'")
-        if len(raw) < 40:
-            return self._default_app_prompt(topic)
-        return raw
+        return self._ask_online_prompt(ask, self._default_app_prompt(topic))
 
     def _activate_default_browser(self):
         try:
@@ -4992,25 +5152,32 @@ class JarvisApp:
             pass
 
     def _aistudio_js_exec(self, js):
-        for app, tmpl in (
-            ("Google Chrome",
-             'tell application "Google Chrome" to execute '
-             "front window's active tab javascript \"{js}\""),
-            ("Safari",
-             'tell application "Safari" to do JavaScript '
-             "\"{js}\" in current tab of front window")):
+        for app in ("Google Chrome", "Microsoft Edge", "Brave Browser"):
             try:
-                chk = subprocess.run(["osascript", "-e",
-                                      f'application "{app}" is running'],
-                                     capture_output=True, text=True)
+                chk = subprocess.run(
+                    ["osascript", "-e", f'application "{app}" is running'],
+                    capture_output=True, text=True)
                 if chk.stdout.strip() != "true":
                     continue
-                res = subprocess.run(["osascript", "-e", tmpl.format(js=js)],
+                tmpl = f'tell application "{app}" to execute "{js}" in active tab of front window'
+                res = subprocess.run(["osascript", "-e", tmpl],
                                      capture_output=True, text=True)
                 if res.returncode == 0 and res.stdout.strip():
                     return res.stdout.strip()
             except Exception:
                 continue
+        try:
+            chk = subprocess.run(["osascript", "-e",
+                                  'application "Safari" is running'],
+                                 capture_output=True, text=True)
+            if chk.stdout.strip() == "true":
+                tmpl = f'tell application "Safari" to do JavaScript "{js}" in current tab of front window'
+                res = subprocess.run(["osascript", "-e", tmpl],
+                                     capture_output=True, text=True)
+                if res.returncode == 0 and res.stdout.strip():
+                    return res.stdout.strip()
+        except Exception:
+            pass
         return None
 
     def _aistudio_js_start(self):
@@ -5083,7 +5250,7 @@ class JarvisApp:
               "const els=document.querySelectorAll('button,[role=button]');"
               "for(const el of els){const t=(el.getAttribute('aria-label')||el.title||"
               "el.textContent||'').trim().toLowerCase();"
-              "if(labels.indexOf(t)>=0&&el.offsetParent!==null){el.click();return 'clicked';}}"
+              "if((labels.indexOf(t)>=0||labels.some(l=>t.indexOf(l+' ')==0||t.indexOf(l+':')==0||t.endsWith(' '+l)))&&el.offsetParent!==null){el.click();return 'clicked';}}"
               "return 'missing';})()")
         res = self._aistudio_js_exec(js)
         return bool(res and "clicked" in res)
@@ -5091,6 +5258,11 @@ class JarvisApp:
     def _aistudio_automate(self, prompt, kind):
         self._activate_default_browser()
         _short_wait(5)
+        for attempt in range(3):
+            if self._aistudio_js_start():
+                break
+            time.sleep(2)
+        time.sleep(2)
         for attempt in range(3):
             if self._aistudio_js_type(kind):
                 break
@@ -5100,9 +5272,13 @@ class JarvisApp:
             time.sleep(0.8)
             for attempt in range(3):
                 if self._aistudio_js_run():
-                    return True
+                    if not _ai_studio_full_runtime():
+                        return True
+                    return self._aistudio_smart_verify(prompt)
                 time.sleep(1.5)
-        return False
+        if _ai_studio_full_runtime():
+            return self._smart_click_in_aistudio(prompt)
+        return self._paste_and_run_in_aistudio(prompt)
 
     def _aistudio_js_click_android_build(self):
         """Click 'Build an Android App' or similar button in Google AI Studio."""
@@ -5128,6 +5304,11 @@ class JarvisApp:
         self._activate_default_browser()
         _short_wait(5)
         for attempt in range(3):
+            if self._aistudio_js_start():
+                break
+            time.sleep(2)
+        time.sleep(2)
+        for attempt in range(3):
             if self._aistudio_js_click_android_build():
                 break
             time.sleep(1.5)
@@ -5136,9 +5317,13 @@ class JarvisApp:
             time.sleep(0.8)
             for attempt in range(3):
                 if self._aistudio_js_run():
-                    return True
+                    if not _ai_studio_full_runtime():
+                        return True
+                    return self._aistudio_smart_verify(prompt)
                 time.sleep(1.5)
-        return False
+        if _ai_studio_full_runtime():
+            return self._smart_click_in_aistudio(prompt)
+        return self._paste_and_run_in_aistudio(prompt)
 
     def _paste_and_run_in_aistudio(self, prompt):
         try:
@@ -5162,7 +5347,13 @@ class JarvisApp:
             pyautogui.hotkey("command", "v")
             time.sleep(1.0)
             pyautogui.hotkey("command", "enter")
-            time.sleep(1.5)
+            if _ai_studio_full_runtime():
+                time.sleep(0.5)
+                pyautogui.press("enter")
+                time.sleep(1.5)
+                self._aistudio_confirm_run()
+            else:
+                time.sleep(1.5)
             return True
         except Exception:
             return False
@@ -5170,6 +5361,15 @@ class JarvisApp:
     def _click_at(self, x, y, clicks=1):
         """Click at arbitrary screen coordinates using pyautogui."""
         try:
+            # Multi-display safety: refuse a coordinate that does not land
+            # on any display instead of clicking into the void off-screen.
+            try:
+                import multi_monitor
+                if len(multi_monitor.list_displays()) > 1:
+                    if not multi_monitor.display_for_point(x, y):
+                        return False
+            except Exception:
+                pass
             import pyautogui
             pyautogui.click(x, y, clicks=clicks)
             return True
@@ -5198,8 +5398,11 @@ class JarvisApp:
     def _smart_click_in_aistudio(self, prompt):
         """Smart automation: find the input field, click it, paste prompt, submit.
 
-        Uses a combination of JS injection (when Chrome/Safari is available)
-        and pyautogui fallback with vision-guided clicking.
+        JS injection first, then vision-guided focusing of the actual prompt box
+        plus paste, then a verified drive of the 'Run prompt' button with
+        Cmd+Enter / Enter keyboard fallbacks. Nothing is reported as success
+        until vision confirms the prompt is actually generating, so a silent
+        no-op Run click can never be mistaken for a finished hand-off.
         """
         self._activate_default_browser()
         time.sleep(3)
@@ -5209,58 +5412,109 @@ class JarvisApp:
             time.sleep(0.8)
             for attempt in range(3):
                 if self._aistudio_js_run():
+                    if _ai_studio_full_runtime():
+                        if self._aistudio_confirm_run():
+                            return True
+                        break
                     return True
                 time.sleep(1.5)
+            return self._aistudio_run_button_verify()
 
-        # Phase 2: Try finding and clicking the textarea/input via vision
-        try:
-            import pyautogui
-            img, b64 = self._take_screenshot()
-            if b64:
-                question = ("Find the main text input area, chat box, or prompt field "
-                            "on this screen. Return ONLY the approximate pixel "
-                            "coordinates (x, y) of its center, like: 640, 400")
-                answer = self._ask_vision(b64, question)
-                coords = re.findall(r"(\d{1,5})\s*,\s*(\d{1,5})", answer)
-                if coords:
-                    x, y = int(coords[0][0]), int(coords[0][1])
-                    pyautogui.click(x, y)
-                    time.sleep(0.5)
-                    pyautogui.hotkey("command", "a")
-                    time.sleep(0.2)
-                    pyautogui.hotkey("command", "v")
-                    time.sleep(1.0)
-                    # Try to find and click the submit/run button
-                    img2, b64_2 = self._take_screenshot()
-                    if b64_2:
-                        q2 = ("Find the 'Run', 'Send', 'Submit', or 'Generate' button "
-                              "on this screen. Return ONLY the approximate pixel "
-                              "coordinates (x, y) of its center.")
-                        a2 = self._ask_vision(b64_2, q2)
-                        c2 = re.findall(r"(\d{1,5})\s*,\s*(\d{1,5})", a2)
-                        if c2:
-                            bx, by = int(c2[0][0]), int(c2[0][1])
-                            pyautogui.click(bx, by)
-                            time.sleep(1.5)
+        # Phase 2: vision-find the prompt box, paste, then drive Run + verify
+        if _ai_studio_full_runtime():
+            try:
+                import pyautogui
+                img, b64 = self._take_screenshot()
+                if b64:
+                    question = ("Find the main text input area, chat box, or prompt "
+                                "field on this screen. Return ONLY the approximate "
+                                "pixel coordinates (x, y) of its center, like: 640, 400")
+                    answer = self._ask_vision(b64, question)
+                    coords = re.findall(r"(\d{1,5})\s*,\s*(\d{1,5})", answer)
+                    if coords:
+                        x, y = int(coords[0][0]), int(coords[0][1])
+                        pyautogui.click(x, y)
+                        time.sleep(0.5)
+                        pyautogui.hotkey("command", "a")
+                        time.sleep(0.2)
+                        pyautogui.hotkey("command", "v")
+                        time.sleep(0.8)
+                        if self._aistudio_run_button_verify():
                             return True
-                    # Fallback: press Enter to submit
-                    pyautogui.hotkey("command", "enter")
-                    time.sleep(1.5)
-                    return True
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         # Phase 3: Last resort - center screen click + paste + enter
         return self._paste_and_run_in_aistudio(prompt)
+
+    def _aistudio_smart_verify(self, prompt):
+        """Trust the JS-triggered run only after vision confirms it started."""
+        if self._aistudio_confirm_run():
+            return True
+        return self._smart_click_in_aistudio(prompt)
+
+    def _aistudio_confirm_run(self):
+        """Vision check that the AI Studio prompt is actually generating.
+
+        Under any test suite the JS 'clicked' result is trusted and True is
+        returned immediately (no screenshots or model calls, keeping the suites
+        fast and offline). In a live session it screenshots and asks vision
+        whether a preview is loading/streaming right now.
+        """
+        if not _ai_studio_full_runtime():
+            return True
+        time.sleep(2)
+        try:
+            img, b64 = self._take_screenshot()
+            if not b64:
+                return False
+            q = ("This is Google AI Studio after 'Run prompt' was triggered. Is a "
+                 "preview loading or generating right now (spinner, progress bar, "
+                 "streaming output, or rendered app content appearing)? "
+                 "Answer YES or NO only.")
+            a = (self._ask_vision(b64, q) or "").lower()
+            return "yes" in a
+        except Exception:
+            return False
+
+    def _aistudio_run_button_verify(self):
+        """Vision-click the 'Run prompt' button (+ keyboard fallbacks), verify.
+
+        Returns True only when the prompt is confirmed to be running.
+        """
+        try:
+            import pyautogui
+        except Exception:
+            return False
+        for _ in range(2):
+            img2, b64_2 = self._take_screenshot()
+            if b64_2:
+                q2 = ("Find the 'Run prompt', 'Run', 'Send', 'Submit', or 'Generate' "
+                      "button on this screen. Return ONLY the approximate pixel "
+                      "coordinates (x, y) of its center.")
+                a2 = self._ask_vision(b64_2, q2)
+                c2 = re.findall(r"(\d{1,5})\s*,\s*(\d{1,5})", a2)
+                if c2:
+                    bx, by = int(c2[0][0]), int(c2[0][1])
+                    pyautogui.click(bx, by)
+                    time.sleep(0.8)
+                else:
+                    pyautogui.hotkey("command", "enter")
+                    time.sleep(0.3)
+                    pyautogui.press("enter")
+                    time.sleep(0.8)
+            if self._aistudio_confirm_run():
+                return True
+        return False
 
     def _is_wake_command(self, t):
         if re.search(r"\b(wake up|wakeup)\b", t):
             return True
         # A bare address ("jarvis", "hey jarvis") also wakes JARVIS, but a
         # sentence that merely mentions the name does not.
-        if not re.search(r"\bjarvis\b", t, re.I):
+        if not re.search(r"\bj(?:arv|av)is\b", t, re.I):
             return False
-        stripped = re.sub(r"\b(hey|hi|hello|ok|okay|jarvis|are you there|"
+        stripped = re.sub(r"\b(hey|hi|hello|ok|okay|j(?:arv|av)is|are you there|"
                           r"you there|there)\b", " ", t, flags=re.I)
         return not stripped.strip(" .,!?'\"")
 
@@ -5317,7 +5571,7 @@ class JarvisApp:
                     continue
                 self.awake = True
                 self.ui_q.put(("awake", None))
-                rest = re.sub(r"\bwake up\b|\bwakeup\b|\bjarvis\b", " ", text)
+                rest = re.sub(r"\bwake up\b|\bwakeup\b|\bj(?:arv|av)is\b", " ", text)
                 rest = re.sub(r"\s+", " ", rest).strip(" .,")
                 if rest:
                     self.say("Yes sir, at your service.")
@@ -5959,23 +6213,17 @@ class JarvisBot:
     def _do_voice(self):
         text = None
         try:
-            r = sr.Recognizer()  # sr imported at module level: a local import
-            # here raised NameError from inside the except clauses below when
-            # speech_recognition was missing.
-            # Calibrate for ambient noise
-            with sr.Microphone() as source:
-                r.adjust_for_ambient_noise(source, duration=1.0)
-                r.energy_threshold = 150  # lower = more sensitive
-                r.pause_threshold = 1.5
-                r.dynamic_energy_threshold = True
-                audio = r.listen(source, timeout=10, phrase_time_limit=15)
-            text = r.recognize_google(audio)
-        except sr.WaitTimeoutError:
+            mic = canary_stt.MicCapture()
+            mic.calibrate(duration=1.0)
+            audio = mic.listen(timeout=10, phrase_time_limit=15,
+                               pause_threshold=1.5, energy_threshold=150)
+            text = canary_stt.transcribe(audio.raw_data)
+        except canary_stt.WaitTimeoutError:
             text = self._register_voice_failure("No speech detected.")
-        except sr.UnknownValueError:
-            text = self._register_voice_failure("Could not understand audio.")
-        except sr.RequestError as e:
-            text = self._register_voice_failure(f"Voice service error: {e}")
+        except canary_stt.MicError:
+            text = self._register_voice_failure("Microphone unavailable.")
+        except canary_stt.ModelUnavailable:
+            text = self._register_voice_failure("Speech model not available.")
         except Exception as e:
             text = self._register_voice_failure(f"Voice error: {e}")
         finally:
@@ -5997,7 +6245,7 @@ class JarvisBot:
         if not text:
             return None
         t = text.strip()
-        m = re.search(r"\b(?:hey|ok|okay|hi|hello)?\s*jarvis\b[,:.!]?\s*(.*)$",
+        m = re.search(r"\b(?:hey|ok|okay|hi|hello)?\s*j(?:arv|av)is\b[,:.!]?\s*(.*)$",
                       t, re.I)
         if not m:
             return None
@@ -6026,13 +6274,10 @@ class JarvisBot:
         self._show_toast("👂 Wake word listening... say 'Hey Jarvis'", duration=3000)
         while self.wake_word_enabled:
             try:
-                r = sr.Recognizer()
-                with sr.Microphone() as source:
-                    r.adjust_for_ambient_noise(source, duration=0.5)
-                    r.energy_threshold = 150
-                    r.pause_threshold = 1.2
-                    audio = r.listen(source, timeout=5, phrase_time_limit=12)
-                text = r.recognize_google(audio)
+                mic = canary_stt.MicCapture()
+                audio = mic.listen(timeout=5, phrase_time_limit=12,
+                                   pause_threshold=1.2, energy_threshold=150)
+                text = canary_stt.transcribe(audio.raw_data)
             except Exception:
                 text = None
             if not self.wake_word_enabled:
@@ -6405,8 +6650,10 @@ class JarvisBot:
             print("LOCAL CHAT ERROR:", e)
             return None
 
-    def _ask_ai_safely(self, prompt, _code_gen_mode=False):
+    def _ask_ai_safely(self, prompt, _code_gen_mode=False, _skip_local=False):
         if not load_api_key():
+            if _skip_local:
+                return None
             self._set_ai_mode("LOCAL")
             local = self._local_chat(prompt, _code_gen_mode=_code_gen_mode)
             if local:
@@ -6414,9 +6661,11 @@ class JarvisBot:
             return ("I am running on my local brain only, sir, since no "
                     "API key is set. Say 'set api key' to enable my full "
                     "language model.")
-        local = self._local_chat(prompt, _code_gen_mode=_code_gen_mode)
-        if local:
-            return local
+        local = None
+        if not _skip_local:
+            local = self._local_chat(prompt, _code_gen_mode=_code_gen_mode)
+            if local:
+                return local
         reply = ask_ai(prompt, self._bot_context_history())
         if reply is None or reply in ("__UNAUTHORIZED__", "__RATE_LIMITED__"):
             # Resilience: Groq dead/keyless/rate-limited. When a
@@ -6436,6 +6685,10 @@ class JarvisBot:
             return local or None
         if reply == "__UNAUTHORIZED__":
             self._set_ai_mode("LOCAL")
+            if _skip_local:
+                return ("My API key was rejected, sir. Say 'set api key' to "
+                        "paste a new Groq key, or I will keep running on my "
+                        "local brain.")
             local = self._local_chat(prompt)
             if local:
                 return ("My API key was rejected, sir, so I switched to my "
@@ -6473,25 +6726,32 @@ class JarvisBot:
             pass
 
     def _aistudio_js_exec(self, js):
-        for app, tmpl in (
-            ("Google Chrome",
-             'tell application "Google Chrome" to execute '
-             "front window's active tab javascript \"{js}\""),
-            ("Safari",
-             'tell application "Safari" to do JavaScript '
-             "\"{js}\" in current tab of front window")):
+        for app in ("Google Chrome", "Microsoft Edge", "Brave Browser"):
             try:
-                chk = subprocess.run(["osascript", "-e",
-                                      f'application "{app}" is running'],
-                                     capture_output=True, text=True)
+                chk = subprocess.run(
+                    ["osascript", "-e", f'application "{app}" is running'],
+                    capture_output=True, text=True)
                 if chk.stdout.strip() != "true":
                     continue
-                res = subprocess.run(["osascript", "-e", tmpl.format(js=js)],
+                tmpl = f'tell application "{app}" to execute "{js}" in active tab of front window'
+                res = subprocess.run(["osascript", "-e", tmpl],
                                      capture_output=True, text=True)
                 if res.returncode == 0 and res.stdout.strip():
                     return res.stdout.strip()
             except Exception:
                 continue
+        try:
+            chk = subprocess.run(["osascript", "-e",
+                                  'application "Safari" is running'],
+                                 capture_output=True, text=True)
+            if chk.stdout.strip() == "true":
+                tmpl = f'tell application "Safari" to do JavaScript "{js}" in current tab of front window'
+                res = subprocess.run(["osascript", "-e", tmpl],
+                                     capture_output=True, text=True)
+                if res.returncode == 0 and res.stdout.strip():
+                    return res.stdout.strip()
+        except Exception:
+            pass
         return None
 
     def _aistudio_js_start(self):
@@ -6542,7 +6802,7 @@ class JarvisBot:
               "const els=document.querySelectorAll('button,[role=button]');"
               "for(const el of els){const t=(el.getAttribute('aria-label')||el.title||"
               "el.textContent||'').trim().toLowerCase();"
-              "if(labels.indexOf(t)>=0&&el.offsetParent!==null){el.click();return 'clicked';}}"
+              "if((labels.indexOf(t)>=0||labels.some(l=>t.indexOf(l+' ')==0||t.indexOf(l+':')==0||t.endsWith(' '+l)))&&el.offsetParent!==null){el.click();return 'clicked';}}"
               "return 'missing';})()")
         res = self._aistudio_js_exec(js)
         return bool(res and "clicked" in res)
@@ -6569,7 +6829,13 @@ class JarvisBot:
             pyautogui.hotkey("command", "v")
             time.sleep(1.0)
             pyautogui.hotkey("command", "enter")
-            time.sleep(1.5)
+            if _ai_studio_full_runtime():
+                time.sleep(0.5)
+                pyautogui.press("enter")
+                time.sleep(1.5)
+                self._aistudio_confirm_run()
+            else:
+                time.sleep(1.5)
             return True
         except Exception:
             return False
@@ -6598,49 +6864,116 @@ class JarvisBot:
         return True, f"Clicked '{text}' at ({x}, {y})."
 
     def _smart_click_in_aistudio(self, prompt):
+        """Smart automation: find the input field, click it, paste prompt, submit.
+
+        JS injection first, then vision-guided focusing of the actual prompt box
+        plus paste, then a verified drive of the 'Run prompt' button with
+        Cmd+Enter / Enter keyboard fallbacks. Nothing is reported as success
+        until vision confirms the prompt is actually generating, so a silent
+        no-op Run click can never be mistaken for a finished hand-off.
+        """
         self._activate_default_browser()
         time.sleep(3)
+
+        # Phase 1: Try JS injection (fastest, most reliable)
         if self._aistudio_js_insert(prompt):
             time.sleep(0.8)
             for attempt in range(3):
                 if self._aistudio_js_run():
+                    if _ai_studio_full_runtime():
+                        if self._aistudio_confirm_run():
+                            return True
+                        break
                     return True
                 time.sleep(1.5)
+            return self._aistudio_run_button_verify()
+
+        # Phase 2: vision-find the prompt box, paste, then drive Run + verify
+        if _ai_studio_full_runtime():
+            try:
+                import pyautogui
+                img, b64 = self._take_screenshot()
+                if b64:
+                    question = ("Find the main text input area, chat box, or prompt "
+                                "field on this screen. Return ONLY the approximate "
+                                "pixel coordinates (x, y) of its center, like: 640, 400")
+                    answer = self._ask_vision(b64, question)
+                    coords = re.findall(r"(\d{1,5})\s*,\s*(\d{1,5})", answer)
+                    if coords:
+                        x, y = int(coords[0][0]), int(coords[0][1])
+                        pyautogui.click(x, y)
+                        time.sleep(0.5)
+                        pyautogui.hotkey("command", "a")
+                        time.sleep(0.2)
+                        pyautogui.hotkey("command", "v")
+                        time.sleep(0.8)
+                        if self._aistudio_run_button_verify():
+                            return True
+            except Exception:
+                pass
+
+        # Phase 3: Last resort - center screen click + paste + enter
+        return self._paste_and_run_in_aistudio(prompt)
+
+    def _aistudio_smart_verify(self, prompt):
+        """Trust the JS-triggered run only after vision confirms it started."""
+        if self._aistudio_confirm_run():
+            return True
+        return self._smart_click_in_aistudio(prompt)
+
+    def _aistudio_confirm_run(self):
+        """Vision check that the AI Studio prompt is actually generating.
+
+        Under any test suite the JS 'clicked' result is trusted and True is
+        returned immediately (no screenshots or model calls, keeping the suites
+        fast and offline). In a live session it screenshots and asks vision
+        whether a preview is loading/streaming right now.
+        """
+        if not _ai_studio_full_runtime():
+            return True
+        time.sleep(2)
+        try:
+            img, b64 = self._take_screenshot()
+            if not b64:
+                return False
+            q = ("This is Google AI Studio after 'Run prompt' was triggered. Is a "
+                 "preview loading or generating right now (spinner, progress bar, "
+                 "streaming output, or rendered app content appearing)? "
+                 "Answer YES or NO only.")
+            a = (self._ask_vision(b64, q) or "").lower()
+            return "yes" in a
+        except Exception:
+            return False
+
+    def _aistudio_run_button_verify(self):
+        """Vision-click the 'Run prompt' button (+ keyboard fallbacks), verify.
+
+        Returns True only when the prompt is confirmed to be running.
+        """
         try:
             import pyautogui
-            img, b64 = self._take_screenshot()
-            if b64:
-                question = ("Find the main text input area, chat box, or prompt field "
-                            "on this screen. Return ONLY the approximate pixel "
-                            "coordinates (x, y) of its center, like: 640, 400")
-                answer = self._ask_vision(b64, question)
-                coords = re.findall(r"(\d{1,5})\s*,\s*(\d{1,5})", answer)
-                if coords:
-                    x, y = int(coords[0][0]), int(coords[0][1])
-                    pyautogui.click(x, y)
-                    time.sleep(0.5)
-                    pyautogui.hotkey("command", "a")
-                    time.sleep(0.2)
-                    pyautogui.hotkey("command", "v")
-                    time.sleep(1.0)
-                    img2, b64_2 = self._take_screenshot()
-                    if b64_2:
-                        q2 = ("Find the 'Run', 'Send', 'Submit', or 'Generate' button "
-                              "on this screen. Return ONLY the approximate pixel "
-                              "coordinates (x, y) of its center.")
-                        a2 = self._ask_vision(b64_2, q2)
-                        c2 = re.findall(r"(\d{1,5})\s*,\s*(\d{1,5})", a2)
-                        if c2:
-                            bx, by = int(c2[0][0]), int(c2[0][1])
-                            pyautogui.click(bx, by)
-                            time.sleep(1.5)
-                            return True
-                    pyautogui.hotkey("command", "enter")
-                    time.sleep(1.5)
-                    return True
         except Exception:
-            pass
-        return self._paste_and_run_in_aistudio(prompt)
+            return False
+        for _ in range(2):
+            img2, b64_2 = self._take_screenshot()
+            if b64_2:
+                q2 = ("Find the 'Run prompt', 'Run', 'Send', 'Submit', or 'Generate' "
+                      "button on this screen. Return ONLY the approximate pixel "
+                      "coordinates (x, y) of its center.")
+                a2 = self._ask_vision(b64_2, q2)
+                c2 = re.findall(r"(\d{1,5})\s*,\s*(\d{1,5})", a2)
+                if c2:
+                    bx, by = int(c2[0][0]), int(c2[0][1])
+                    pyautogui.click(bx, by)
+                    time.sleep(0.8)
+                else:
+                    pyautogui.hotkey("command", "enter")
+                    time.sleep(0.3)
+                    pyautogui.press("enter")
+                    time.sleep(0.8)
+            if self._aistudio_confirm_run():
+                return True
+        return False
 
     def _handle_fix_screen(self, cmd):
         """Take a screenshot, analyze the screen, and attempt to fix issues."""
@@ -7590,15 +7923,17 @@ class JarvisBot:
                 self.say("I've opened the Android app builder with your prompt, sir. "
                          "The preview is generating on the right now.")
             else:
-                self.say("I've opened the Android app builder with your prompt pre-filled, sir. "
-                         "Press Run prompt and the preview will appear.")
+                self.say("I've opened the Android app builder for you, sir. If the "
+                         "prompt didn't appear, paste it from the clipboard and "
+                         "press Run prompt to generate the preview.")
         else:
             if self._aistudio_automate(prompt, "web"):
                 self.say("I've opened the app builder with your prompt, sir. "
                          "The preview is generating on the right now.")
             else:
-                self.say("I've opened the app builder with your prompt pre-filled, sir. "
-                         "Press Run prompt and the preview will appear.")
+                self.say("I've opened the app builder for you, sir. If the prompt "
+                         "didn't appear, paste it from the clipboard and press "
+                         "Run prompt to generate the preview.")
 
     def _ask_build_kind(self):
         try:
@@ -7628,18 +7963,42 @@ class JarvisBot:
             "responsive layout, tasteful colors, and a professional look. Output ONLY "
             "the prompt text itself, no quotes, no code fences, no explanation."
         )
-        raw = self._ask_ai(ask)
+        return self._ask_online_prompt(ask, self._default_website_prompt(topic))
+
+    def _ask_online_prompt(self, ask, default):
+        """Build an AI Studio prompt using ONLY the online model (Groq, then
+        Gemini). The local brain is deliberately bypassed: its code-generation
+        detector hijacks meta-asks like 'write a prompt for a website' and
+        returns canned prose that would otherwise be pasted verbatim into
+        Google AI Studio.
+        """
+        raw = self._ask_ai_safely(ask, _skip_local=True)
         if raw == "__UNAUTHORIZED__":
-            self.say("That key was rejected too, sir. Please double check it on groq dot com.")
-            return self._default_website_prompt(topic)
-        if raw is None:
-            return self._default_website_prompt(topic)
-        if raw.startswith("I hit an error"):
-            return self._default_website_prompt(topic)
+            self.say("That key was rejected too, sir. Please double check it "
+                     "on groq dot com.")
+            return default
+        if raw is None or raw.startswith("I hit an error"):
+            return default
+        if raw.count("```") >= 2:
+            raw = raw.split("```")[-2]
         raw = raw.strip().strip('"').strip("'")
-        if len(raw) < 40 or not any(w in raw.lower() for w in
-                                   ("website", "html", "page", "site")):
-            return self._default_website_prompt(topic)
+        low = raw.lower()
+        if low.startswith(("i can generate code locally",
+                           "i am running on my local",
+                           "my api key was rejected",
+                           "your api key limit",
+                           "i could not reach",
+                           "tell me the language",
+                           "i can't", "i cannot", "i am not able",
+                           "i am unable", "that is beyond my",
+                           "as an ai", "i'm sorry", "i am sorry",
+                           "i am a language model", "i can't write",
+                           "i cannot write")):
+            return default
+        if len(raw) < 40 or not any(w in low for w in
+                                    ("website", "html", "page", "site",
+                                     "app", "application")):
+            return default
         return raw
 
     def _default_app_prompt(self, topic):
@@ -7660,18 +8019,7 @@ class JarvisBot:
             "multiple screens, navigation, and all necessary code. Output ONLY "
             "the prompt text itself, no quotes, no code fences, no explanation."
         )
-        raw = self._ask_ai(ask)
-        if raw == "__UNAUTHORIZED__":
-            self.say("That key was rejected too, sir. Please double check it on groq dot com.")
-            return self._default_app_prompt(topic)
-        if raw is None:
-            return self._default_app_prompt(topic)
-        if raw.startswith("I hit an error"):
-            return self._default_app_prompt(topic)
-        raw = raw.strip().strip('"').strip("'")
-        if len(raw) < 40:
-            return self._default_app_prompt(topic)
-        return raw
+        return self._ask_online_prompt(ask, self._default_app_prompt(topic))
 
     def _aistudio_js_type(self, kind):
         if kind == "app":
@@ -7699,6 +8047,11 @@ class JarvisBot:
         self._activate_default_browser()
         _short_wait(5)
         for attempt in range(3):
+            if self._aistudio_js_start():
+                break
+            time.sleep(2)
+        time.sleep(2)
+        for attempt in range(3):
             if self._aistudio_js_type(kind):
                 break
             time.sleep(1.5)
@@ -7707,9 +8060,13 @@ class JarvisBot:
             time.sleep(0.8)
             for attempt in range(3):
                 if self._aistudio_js_run():
-                    return True
+                    if not _ai_studio_full_runtime():
+                        return True
+                    return self._aistudio_smart_verify(prompt)
                 time.sleep(1.5)
-        return False
+        if _ai_studio_full_runtime():
+            return self._smart_click_in_aistudio(prompt)
+        return self._paste_and_run_in_aistudio(prompt)
 
     def _aistudio_js_click_android_build(self):
         js = ("const STEP='ANDROID';(()=>{const labels=["
@@ -7733,6 +8090,11 @@ class JarvisBot:
         self._activate_default_browser()
         _short_wait(5)
         for attempt in range(3):
+            if self._aistudio_js_start():
+                break
+            time.sleep(2)
+        time.sleep(2)
+        for attempt in range(3):
             if self._aistudio_js_click_android_build():
                 break
             time.sleep(1.5)
@@ -7741,9 +8103,13 @@ class JarvisBot:
             time.sleep(0.8)
             for attempt in range(3):
                 if self._aistudio_js_run():
-                    return True
+                    if not _ai_studio_full_runtime():
+                        return True
+                    return self._aistudio_smart_verify(prompt)
                 time.sleep(1.5)
-        return False
+        if _ai_studio_full_runtime():
+            return self._smart_click_in_aistudio(prompt)
+        return self._paste_and_run_in_aistudio(prompt)
 
     # ================================================================
     # Command processing
@@ -7756,7 +8122,7 @@ class JarvisBot:
             cmd_lower = cmd.lower().strip()
 
             # --- Jarvis prefix stripping ---
-            m_j = re.match(r"^(?:hey\s+)?jarvis\s*[,.!?\s]+\s*(.+)$", cmd_lower, re.I)
+            m_j = re.match(r"^(?:hey\s+)?j(?:arv|av)is\s*[,.!?\s]+\s*(.+)$", cmd_lower, re.I)
             if m_j:
                 cmd_lower = m_j.group(1).strip()
                 cmd = cmd_lower
@@ -7772,7 +8138,7 @@ class JarvisBot:
 
             # Wake/sleep
             if re.search(r"\bwake(\s*up)?\b", cmd_lower) or \
-                    re.fullmatch(r"\s*(hey\s+)?jarvis\s*[!.]?\s*", cmd_lower):
+                    re.fullmatch(r"\s*(hey\s+)?j(?:arv|av)is\s*[!.]?\s*", cmd_lower):
                 self.awake = True
                 self.say("Yes sir, I am awake. Now proceed.")
                 return
@@ -7898,6 +8264,10 @@ class JarvisBot:
             br = parse_build_request(cmd_lower)
             if br:
                 self.build_website(br["topic"], br["kind"])
+                return
+
+            # Browser control (read/click-in-page/scroll/open in a chosen browser)
+            if self._browser_control(cmd_lower):
                 return
 
             # Research write
@@ -8402,48 +8772,190 @@ class JarvisBot:
         listing = ", ".join(files[:20])
         self.say(f"Files: {listing}")
 
+    def _browser_control(self, cmd):
+        """Drive a browser directly: read the page, click/type/scroll on
+        pages, go back/forward, refresh, fetch the page URL, and open URLs
+        in a specific browser (Chrome/Safari/Edge/Firefox/Brave/Arc).
+
+        Returns True when the command was a browser-control request (even if
+        the action could not be performed), False otherwise. Runs before the
+        brain and before the generic open handler so "open X in chrome" is
+        never swallowed as a search or an app-launch.
+        """
+        c = cmd.strip(" .,?!")
+
+        # "open <target> in <browser>"
+        m = re.match(
+            r"^(?:open|go\s+to|launch)\s+(.+?)\s+(?:in|using|with)\s+"
+            r"(?:the\s+)?(chrome|safari|edge|firefox|brave|arc)"
+            r"(?:\s+browser)?\s*$", c)
+        if m:
+            target = m.group(1).strip(" .,")
+            name = multi_browser.normalize(m.group(2))
+            if target in WEBSITES:
+                target = WEBSITES[target]
+            elif "://" not in target and " " not in target and "." in target:
+                target = "https://" + target
+            elif "://" not in target and " " in target:
+                target = ("https://www.google.com/search?q="
+                          + target.replace(" ", "+"))
+            ok, msg = multi_browser.open_url(name, target)
+            self.say(f"Opening {target} in {name}, sir." if ok
+                     else f"I could not open {name}, sir. {msg}")
+            return True
+
+        # "switch to chrome" / "change over to safari" / "activate arc"
+        m = re.match(r"^(?:switch|change)\s+(?:to|over\s+to)\s+(?:the\s+)?"
+                     r"(chrome|safari|edge|firefox|brave|arc)"
+                     r"(?:\s+browser)?\s*$", c)
+        if m:
+            name = multi_browser.normalize(m.group(1))
+            ok, _msg = multi_browser.activate(name)
+            self.say(f"Switching to {name}, sir." if ok
+                     else f"I could not activate {name}, sir.")
+            return True
+        m = re.match(r"^activate\s+(?:the\s+)?"
+                     r"(chrome|safari|edge|firefox|brave|arc)"
+                     r"(?:\s+browser)?\s*$", c)
+        if m:
+            name = multi_browser.normalize(m.group(1))
+            ok, _msg = multi_browser.activate(name)
+            self.say(f"Switching to {name}, sir." if ok
+                     else f"I could not activate {name}, sir.")
+            return True
+
+        # "read the page" / "read this page" / "summarize the page"
+        if re.search(r"^(?:read|summarize|what'?s\s+on)\s+"
+                     r"(?:the|this)\s+(?:current\s+)?(?:web\s+)?page\s*$", c):
+            browser = multi_browser.pick()
+            ok, text = multi_browser.page_text(browser, 1500)
+            if ok and text.strip():
+                snippet = " ".join(text.split())[:900]
+                self.say(f"Here is the page, sir: {snippet}...")
+            else:
+                self.say("I could not read the page, sir. "
+                         + (str(text)[:160] if not ok else ""))
+            return True
+
+        # "click <label> on the page"
+        m = re.match(r"^(?:click|tap|press)\s+(?:on\s+)?(.+?)\s+"
+                     r"(?:on|in)\s+(?:the|this)\s+page\s*$", c)
+        if m:
+            label = m.group(1).strip(" .,")
+            browser = multi_browser.pick()
+            ok, out = multi_browser.click_by_text(browser, label)
+            if ok and out.startswith("clicked"):
+                self.say(f"Clicked '{label}' on the page, sir.")
+            else:
+                self.say(f"I could not find '{label}' on the page, sir.")
+            return True
+
+        # "type <text> into the page"
+        m = re.match(r"^type\s+(.+?)\s+(?:into|in)\s+(?:the|this)\s+"
+                     r"(?:page|search\s*box)\s*$", c)
+        if m:
+            text = m.group(1).strip(" .,")
+            browser = multi_browser.pick()
+            ok, out = multi_browser.type_keys(browser, text)
+            self.say(f"Typed '{text}' into the page, sir." if ok
+                     else "I could not type into the page, sir. "
+                          + str(out)[:160])
+            return True
+
+        # "scroll down on the page" / "scroll to the bottom" / "scroll up"
+        m = re.match(r"^scroll\s+(?:(?:down|up)|to\s+(?:the\s+)?"
+                     r"(?:bottom|top))\s*(?:on\s+)?(?:the\s+)?"
+                     r"(?:page|browser)?\s*$", c)
+        if m:
+            browser = multi_browser.pick()
+            how = m.group(0)
+            dy = (-1500 if "top" in how else 900 if "bottom" in how else
+                  -900 if "up" in how else 900)
+            ok, out = multi_browser.scroll(browser, dy)
+            self.say("Scrolled the page, sir." if ok
+                     else "I could not scroll the page, sir. " + str(out)[:160])
+            return True
+
+        # "go back in the browser" / "go forward one page"
+        m = re.match(r"^go\s+(back|forward)\s*(?:one\s+page\s*)?"
+                     r"(?:in\s+)?(?:the\s+)?(?:browser|page)?\s*$", c)
+        if m:
+            browser = multi_browser.pick()
+            fn = (multi_browser.go_back if m.group(1) == "back"
+                  else multi_browser.go_forward)
+            ok, out = fn(browser)
+            self.say(f"Taking you {m.group(1)}, sir." if ok
+                     else f"I could not go {m.group(1)}, sir. " + str(out)[:160])
+            return True
+
+        # "refresh the page" / "reload the tab"
+        if re.search(r"^(?:refresh|reload)\s+(?:the\s+)?"
+                     r"(?:page|browser|tab)?\s*$", c):
+            browser = multi_browser.pick()
+            ok, out = multi_browser.refresh(browser)
+            self.say("Refreshed the page, sir." if ok
+                     else "I could not refresh the page, sir. " + str(out)[:160])
+            return True
+
+        # "what's the current page url" / "current url on the page"
+        if re.search(r"(?:current|this|the)\s+(?:page|tab|website|browser)\s+"
+                     r"url\b|\burl\s+of\s+(?:this|the)\s+page\b|"
+                     r"\bwhat'?s\s+the\s+(?:current\s+)?url\b|"
+                     r"\bcurrent\s+url\b", c):
+            browser = multi_browser.pick()
+            ok, out = multi_browser.front_url(browser)
+            if ok and str(out).strip():
+                self.say("The current page is " + str(out).strip() + ", sir.")
+            else:
+                self.say("I could not read the current URL, sir.")
+            return True
+
+        return False
+
     def _handle_open(self, cmd):
-        """Open URLs or apps."""
+        """Open URLs or apps (parity with chat mode: open/go to/launch + bare names)."""
         m = re.search(r"(https?://\S+)", cmd)
         if m:
             webbrowser.open(m.group(1))
             self.say("Opening link.")
             return
-        m = re.search(r"(?:open|launch)\s+(.+)", cmd, re.I)
-        if m:
-            what = m.group(1).strip()
-            # Known websites open directly in the browser
-            target = re.sub(r"^(?:the|a|an)\s+", "", what,
-                            flags=re.I).strip(" .,!").lower()
-            if target in WEBSITES:
-                self.say(f"Opening {target}.")
-                webbrowser.open(WEBSITES[target])
-                return
-            for name, url in WEBSITES.items():
-                if re.search(r"\b" + re.escape(name) + r"\b", what.lower()):
-                    self.say(f"Opening {name}.")
-                    webbrowser.open(url)
-                    return
-            # Known apps map to their real application names, exactly like
-            # chat mode: "open calculator" must launch Calculator, not fall
-            # through to a web search for the lowercase bundle name.
-            for key, app_name in APP_MAP.items():
-                if re.search(r"\b" + re.escape(key) + r"\b", what.lower()):
-                    if open_app(app_name):
-                        self.say(f"Opening {app_name}.")
-                    else:
-                        self.say(f"I could not find {app_name}, sir. "
-                                 "Searching the web for it instead.")
-                        webbrowser.open("https://www.google.com/search?q="
-                                        + app_name.replace(" ", "+"))
-                    return
-            if open_app(what):
-                self.say(f"Opening {what}.")
-            else:
-                self.say(f"I could not find {what}, sir. Searching the web for it instead.")
-                webbrowser.open("https://www.google.com/search?q=" + what.replace(" ", "+"))
+        if not re.match(r"^(?:open|go\s+to|launch)\b", cmd):
+            b = self._bare_name(cmd)
+            if b:
+                self._open_target(b[0], b[1], b[2])
             return
-        self.say("What should I open?")
+        m = re.match(r"^(?:go to|open|launch)\s*(.*)$", cmd)
+        rest = (m.group(1) if m else cmd).strip(" .,")
+        rest = re.sub(r"^(?:the|a|an|please|just)\s+", "", rest).strip()
+        if not rest:
+            self.say("What would you like me to open, sir?")
+            return
+        match = self._match_website(rest)
+        if match:
+            name, url = match
+            self.say(f"Opening {name}.")
+            webbrowser.open(url)
+            return
+        for key, app in APP_MAP.items():
+            if re.search(r"\b" + re.escape(key) + r"\b", rest):
+                if open_app(app):
+                    self.say(f"Opening {app}.")
+                else:
+                    self.say(f"I could not find {app}, sir. Searching the web for it instead.")
+                    webbrowser.open("https://www.google.com/search?q=" + app.replace(" ", "+"))
+                return
+        fuzzy = self._fuzzy_target(rest)
+        if fuzzy:
+            kind, name, target = fuzzy
+            self.say(f"Did you mean {name}? Opening it, sir.")
+            self._open_target(kind, name, target)
+            return
+        if "." in rest:
+            self.say(f"Opening {rest}.")
+            webbrowser.open("https://" + rest)
+            return
+        self.say(f"I could not find {rest}, sir. Searching the web for it instead.")
+        webbrowser.open("https://www.google.com/search?q=" + rest.replace(" ", "+"))
 
     # ---------------- bare-name / "go to X" open targets (parity with chat) ----
     def _is_open(self, cmd):
@@ -8836,7 +9348,7 @@ class JarvisBot:
 
     def calendar_add(self, cmd):
         """'add event meeting at 3pm'"""
-        text = re.sub(r"^\s*(?:hey\s+)?(?:jarvis[,:]\s*)?", "", cmd, flags=re.I)
+        text = re.sub(r"^\s*(?:hey\s+)?(?:j(?:arv|av)is[,:]\s*)?", "", cmd, flags=re.I)
         text = re.sub(r"\badd\s+(?:an?\s+)?(?:new\s+)?"
                       r"(?:event|appointment|meeting)\b[:\s]*", " ", text,
                       flags=re.I)

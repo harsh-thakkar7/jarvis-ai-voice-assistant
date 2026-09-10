@@ -11,6 +11,7 @@ environment and are never logged verbatim -- use :func:`mask_key`.
 """
 
 import os
+import re
 import time
 from dataclasses import dataclass
 
@@ -25,6 +26,17 @@ RETRY_SLEEP_SECONDS = 0.8
 MAX_ATTEMPTS = 2
 HISTORY_WINDOW = 10
 TEMPERATURE = 0.8
+
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+
+# On-disk fallback for the Gemini key, mirroring main.py's
+# ``.jarvis_api_key`` convention for Groq: a GUI assistant cannot rely on
+# env vars surviving a relaunch, so the key is persisted here (mode 0600)
+# alongside ``~`` user files and read only when $GEMINI_API_KEY is unset.
+_GEMINI_KEY_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".jarvis_gemini_key",
+)
 
 
 @dataclass(frozen=True)
@@ -67,6 +79,15 @@ PROVIDERS = {
         "ANTHROPIC_API_KEY",
         "anthropic",
     ),
+    "google": Provider(
+        "google",
+        # Gemini's OpenAI-compatible endpoint: reuses the whole 'openai'
+        # request/parse path, so no API-key or body special-casing is needed.
+        "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        os.environ.get("JARVIS_GEMINI_MODEL", "gemini-3.6-flash"),
+        GEMINI_API_KEY_ENV,
+        "openai",
+    ),
 }
 
 _STYLES_NEEDING_KEY = ("openai", "anthropic")
@@ -86,9 +107,126 @@ def mask_key(secret: str) -> str:
     return "*" * 8 + secret[-4:]
 
 
+def provider_api_key(provider: Provider) -> str:
+    """Env-first, then the on-disk key file (same convention as Groq).
+
+    Returns the raw key (never logged). The Gemini key survives relaunches
+    because ``LLMClient`` resolves it from file when the env var is unset.
+    """
+    if not provider.api_key_env:
+        return ""
+    key = os.environ.get(provider.api_key_env, "").strip()
+    if key:
+        return key
+    if provider.api_key_env == GEMINI_API_KEY_ENV:
+        try:
+            with open(_GEMINI_KEY_FILE, "r", encoding="utf-8") as f:
+                return f.read().strip().strip("'\"")
+        except Exception:
+            return ""
+    return ""
+
+
+def configure_gemini_key(key: str) -> bool:
+    """Persist a Gemini API key to the project key file (mode 0600).
+
+    Returns True on success. Callers should treat the key as confidential:
+    never log it, only ever display via :func:`mask_key`.
+    """
+    key = (key or "").strip().strip("'\"")
+    if len(key) < 10:
+        return False
+    try:
+        with open(_GEMINI_KEY_FILE, "w", encoding="utf-8") as f:
+            f.write(key)
+        os.chmod(_GEMINI_KEY_FILE, 0o600)
+        return True
+    except Exception:
+        logger.exception("failed to persist Gemini API key")
+        return False
+
+
+def gemini_configured() -> bool:
+    """True when a Gemini key is available (env or the on-disk key file)."""
+    return bool(provider_api_key(PROVIDERS["google"]))
+
+
 def _post(url, json=None, headers=None, timeout=None):
     """Network seam: the single choke point tests may monkeypatch."""
     return requests.post(url, json=json, headers=headers, timeout=timeout)
+
+
+def chat_anywhere(prompt, history=None, system="", chain=("groq", "google")):
+    """Try providers in *chain* order; first non-empty reply wins.
+
+    Skips backends whose API key is unset so the resilient paths can be
+    stitched together from environment alone (Groq first, Gemini as the
+    quota/outage escape hatch by default). Never raises.
+    """
+    if not isinstance(prompt, str) or not prompt.strip():
+        return None
+    for name in chain:
+        provider = PROVIDERS.get(name)
+        if provider is None:
+            continue
+        if provider.api_key_env and not provider_api_key(provider):
+            continue
+        try:
+            reply = LLMClient(provider=provider).chat(
+                prompt, history=history, system=system)
+        except Exception:
+            logger.warning("chat_anywhere: %s failed", name, exc_info=True)
+            reply = None
+        if reply:
+            return reply
+    return None
+
+
+_PLANNER_GATE = re.compile(
+    r"\b(compare|contrast|difference between|pros and cons|trade.?off|"
+    r"plan|outline|step.by.step|analy|evaluate|weigh|decide|choose "
+    r"between|best approach|roadmap|architecture|strategy|design)\w*\b",
+    re.I,
+)
+
+PLANNER_SYSTEM = (
+    "You are the JARVIS planning layer. The user asked a hard, multi-step "
+    "question that deserves more than a one-liner. Respond with a clear "
+    "spoken plan or short structured analysis: numbered steps or a compact "
+    "comparison. Under 120 words, no preamble or closing pleasantries, "
+    "address the user as 'sir'."
+)
+
+
+def planner_reply(text, history=None):
+    """Gemini-backed planner for genuinely multi-step questions.
+
+    Fires only when a GEMINI_API_KEY is configured *and* the text looks like
+    a hard problem (comparison / plan / trade-off / analysis). Everything
+    else falls through untouched, so the fast Groq/local path is never
+    slowed down. Returns plan text or ``None``.
+    """
+    if not gemini_configured():
+        return None
+    if not (isinstance(text, str) and 3 <= len(text) <= 4000):
+        return None
+    if not _PLANNER_GATE.search(text):
+        return None
+    try:
+        reply = chat_anywhere(text, history=history, system=PLANNER_SYSTEM,
+                              chain=("google",))
+        if not reply:
+            return None
+        # Route Gemini output through the harness so spoken replies are
+        # normalized exactly like Groq's (strip fences and butler chatter).
+        try:
+            from prompt_harness import clean_reply
+            return clean_reply(reply) or reply
+        except Exception:
+            return reply
+    except Exception:
+        logger.warning("planner_reply failed", exc_info=True)
+        return None
 
 
 class LLMClient:
@@ -110,7 +248,10 @@ class LLMClient:
         transport/parse failure. Never raises.
         """
         try:
-            return self._chat_impl(prompt, history, system or "")
+            text = self._chat_impl(prompt, history, system or "")
+            # Contract: reply text or None. Empty bodies collapse to None
+            # so callers testing ``is None`` get the documented failure.
+            return (text or "").strip() or None
         except Exception:
             logger.exception("chat failed unexpectedly")
             return None
@@ -128,8 +269,7 @@ class LLMClient:
     # ------------------------------------------------------------------ #
 
     def _api_key(self) -> str:
-        env = self.provider.api_key_env
-        return os.environ.get(env, "").strip() if env else ""
+        return provider_api_key(self.provider)
 
     def _messages(self, prompt: str, history, system: str) -> list:
         msgs = []
@@ -182,7 +322,9 @@ class LLMClient:
         elif style == "ollama":
             text = (data.get("message") or {}).get("content", "")
         else:
-            choice = (data.get("choices") or [{}])[0]
+            choices = data.get("choices")
+            # Do not index a dict: some gateways return ``"choices": {}``.
+            choice = choices[0] if isinstance(choices, list) and choices else {}
             msg = choice.get("message") or {}
             # Reasoning models can spend every token thinking; surface that.
             text = msg.get("content", "") or msg.get("reasoning", "") or ""
@@ -215,6 +357,12 @@ class LLMClient:
                     time.sleep(RETRY_SLEEP_SECONDS)
                     continue
                 if not 200 <= status < 300:
+                    # Rate limits are transient; retry like 5xx instead of
+                    # failing the turn outright. Other 4xx are fatal.
+                    if status == 429:
+                        last_err = "HTTP 429"
+                        time.sleep(RETRY_SLEEP_SECONDS)
+                        continue
                     logger.error("%s returned HTTP %s", p.name, status)
                     return None
                 return self._extract_text(resp.json())

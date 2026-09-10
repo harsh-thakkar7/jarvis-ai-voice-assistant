@@ -23,8 +23,10 @@ def _load():
 
 def _save(tasks):
     try:
-        with open(_TODO_FILE, "w", encoding="utf-8") as f:
+        partial = _TODO_FILE + ".tmp"
+        with open(partial, "w", encoding="utf-8") as f:
             json.dump(tasks, f, indent=2, ensure_ascii=False)
+        os.replace(partial, _TODO_FILE)
     except Exception as e:
         print("TODO SAVE ERROR:", e)
 

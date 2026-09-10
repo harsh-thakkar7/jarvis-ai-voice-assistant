@@ -144,7 +144,9 @@ def test_online_handoff_copies_prompt_and_opens_ai_studio(
     assert copied and copied[0].decode("utf-8") == "PROMPT TEXT"
     opens = [args[1] for args, _inp in calls
              if args[0] == "open" and len(args) > 1]
-    assert wdb.AI_STUDIO_URL in opens
+    assert len(opens) == 1
+    assert opens[0].startswith(wdb.AI_STUDIO_BUILD_URL)
+    assert "PROMPT%20TEXT" in opens[0]
     assert not list(env.tmp.iterdir())
     assert env.opened == []
     assert "clipboard" in reply and "AI Studio" in reply
